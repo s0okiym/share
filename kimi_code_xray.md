@@ -477,8 +477,8 @@ REALITY（Realistic Encryption Layer Identity Transition Yield）是一种高级
 ```mermaid
 flowchart TD
     A[Client Hello] -->|"SessionID[0:2]=Version"| B[Server Reality Check]
-    A -->|SessionID[4:7]=Timestamp| B
-    A -->|SessionID[8:15]=ShortID| B
+    A -->|"SessionID[4:7]=Timestamp"| B
+    A -->|"SessionID[8:15]=ShortID"| B
     B -->|X25519MLKEM768| C[Shared Secret]
     C -->|HKDF| D[AuthKey]
     D -->|AEAD Seal| E[Encrypted SessionID]
