@@ -47,22 +47,22 @@ DeepEP 是 DeepSeek 开源的专为 **Mixture-of-Experts (MoE)** 模型的 **Exp
 ```mermaid
 graph TB
     subgraph "Python 层 (deep_ep/)"
-        A[Buffer<br/>用户接口] --> B[EventOverlap<br/>事件管理]
+        A["Buffer<br/>用户接口"] --> B["EventOverlap<br/>事件管理"]
         A --> C[Config<br/>性能配置]
     end
     
     subgraph "C++/PyBind11 层 (csrc/)"
-        D[deep_ep.cpp<br/>Buffer 类实现]
-        D --> E[layout.cu<br/>布局计算]
-        D --> F[intranode.cu<br/>节点内通信]
-        D --> G[internode.cu<br/>节点间通信]
-        D --> H[internode_ll.cu<br/>低延迟通信]
+        D["deep_ep.cpp<br/>Buffer 类实现"]
+        D --> E["layout.cu<br/>布局计算"]
+        D --> F["intranode.cu<br/>节点内通信"]
+        D --> G["internode.cu<br/>节点间通信"]
+        D --> H["internode_ll.cu<br/>低延迟通信"]
     end
     
     subgraph "基础设施层"
-        I[NVSHMEM<br/>RDMA 通信]
-        J[CUDA IPC<br/>NVLink 通信]
-        K[IBGDA<br/>GPU 直接 RDMA]
+        I["NVSHMEM<br/>RDMA 通信"]
+        J["CUDA IPC<br/>NVLink 通信"]
+        K["IBGDA<br/>GPU 直接 RDMA"]
     end
     
     A --> D
@@ -403,7 +403,7 @@ flowchart LR
 ```mermaid
 flowchart TD
     A[low_latency_dispatch] --> B{发送阶段}
-    B --> C[Warp Group 0~N-1:<br/>FP8 转换 + RDMA 发送]
+    B --> C["Warp Group 0~N-1:<br/>FP8 转换 + RDMA 发送"]
     B --> D[最后一个 Warp:<br/>统计 expert 计数 + 清理]
     
     C --> C1[读取 token 数据]
