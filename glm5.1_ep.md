@@ -48,7 +48,7 @@ DeepEP 是 DeepSeek 开源的专为 **Mixture-of-Experts (MoE)** 模型的 **Exp
 graph TB
     subgraph "Python 层 (deep_ep/)"
         A["Buffer<br/>用户接口"] --> B["EventOverlap<br/>事件管理"]
-        A --> C[Config<br/>性能配置]
+        A --> C["Config<br/>性能配置"]
     end
     
     subgraph "C++/PyBind11 层 (csrc/)"
@@ -152,7 +152,7 @@ Dispatch 是将 token 发送到其目标 expert 所在 rank 的过程。它分�
 
 ```mermaid
 flowchart TD
-    A["输入: topk_idx<br/>num_tokens × num_topk] --> B[GPU Kernel:<br/>统计 per-expert/per-rank token 数"]
+    A["输入: topk_idx<br/>num_tokens × num_topk"] --> B["GPU Kernel:<br/>统计 per-expert/per-rank token 数"]
     B --> C{num_experts > 0?}
     C -->|是| D["前几个 SM:<br/>统计每个 expert 收到的 token 数"]
     C --> E["后几个 SM:<br/>统计每个 rank 的 token 数<br/>+ is_token_in_rank 矩阵"]
@@ -215,14 +215,14 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A[开始 Internode Notify] --> B[RDMA 通知:<br/>通过 NVSHMEM RDMA 发送<br/>num_tokens_per_rdma_rank]
-    B --> C[NVL 通知:<br/>将 RDMA 接收结果通过 NVLink<br/>转发给节点内其他 rank]
+    A["开始 Internode Notify] --> B[RDMA 通知:<br/>通过 NVSHMEM RDMA 发送<br/>num_tokens_per_rdma_rank"]
+    B --> C["NVL 通知:<br/>将 RDMA 接收结果通过 NVLink<br/>转发给节点内其他 rank"]
     C --> D[计算两层前缀和:]
-    D --> E[rdma_channel_prefix_matrix<br/>RDMA rank × channel]
-    D --> F[gbl_channel_prefix_matrix<br/>全局 rank × channel]
+    D --> E["rdma_channel_prefix_matrix<br/>RDMA rank × channel"]
+    D --> F["gbl_channel_prefix_matrix<br/>全局 rank × channel"]
     D --> G[recv_rdma_rank_prefix_sum]
     D --> H[recv_gbl_rank_prefix_sum]
-    E --> I[CPU busy-wait<br/>moe_recv_counter + moe_recv_rdma_counter]
+    E --> I["CPU busy-wait<br/>moe_recv_counter + moe_recv_rdma_counter"]
     F --> I
 ```
 
@@ -234,7 +234,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[Config: num_sms 个 SM<br/>num_channels = num_sms / 2] --> B[每个 channel 分配两个 block:]
+    A["Config: num_sms 个 SM<br/>num_channels = num_sms / 2"] --> B[每个 channel 分配两个 block:]
     B --> C[偶数 block: 发送端]
     B --> D[奇数 block: 接收端]
     
@@ -244,9 +244,9 @@ flowchart TD
     G --> H[使用 LD/ST 或 memcpy 写入目标 rank 的 buffer]
     
     D --> I[接收端逻辑:]
-    I --> J[写入 recv_x, recv_topk_idx,<br/>recv_topk_weights, recv_src_idx]
+    I --> J["写入 recv_x, recv_topk_idx,<br/>recv_topk_weights, recv_src_idx"]
     
-    H --> K[使用生产者-消费者模型:<br/>head/tail 指针同步]
+    H --> K["使用生产者-消费者模型:<br/>head/tail 指针同步"]
     I --> K
 ```
 
@@ -264,11 +264,11 @@ flowchart TD
 ```mermaid
 flowchart LR
     subgraph "源节点"
-        A[本地 GPU] -->|RDMA 写入| B[同 GPU index 的<br/>远端节点 RDMA buffer]
+        A["本地 GPU] -->|RDMA 写入| B[同 GPU index 的<br/>远端节点 RDMA buffer"]
     end
     
     subgraph "目的节点"
-        B[RDMA buffer] -->|NVLink 转发| C[目标 GPU 的<br/>NVL buffer]
+        B["RDMA buffer] -->|NVLink 转发| C[目标 GPU 的<br/>NVL buffer"]
         C --> D[recv_x 等输出]
     end
 ```
@@ -287,17 +287,17 @@ flowchart LR
 flowchart TD
     Start([用户调用 dispatch]) --> Layout{有 handle??}
     
-    Layout -->|否| GL[get_dispatch_layout<br/>计算布局]
-    GL --> Notify[notify_dispatch<br/>交换元数据]
-    Notify --> CPUSync[CPU Busy-wait<br/>等待接收计数]
+    Layout -->|否| GL["get_dispatch_layout<br/>计算布局"]
+    GL --> Notify["notify_dispatch<br/>交换元数据"]
+    Notify --> CPUSync["CPU Busy-wait<br/>等待接收计数"]
     CPUSync --> Alloc[分配输出 tensor]
     
-    Layout -->|是| Cached[cached_notify_dispatch<br/>仅 barrier + 清理]
+    Layout -->|是| Cached["cached_notify_dispatch<br/>仅 barrier + 清理"]
     Cached --> Alloc
     
     Alloc --> Dispatch{internode?}
-    Dispatch -->|否| Intra[intranode_dispatch<br/>NVLink chunked 传输]
-    Dispatch -->|是| Inter[internode_dispatch<br/>RDMA + NVLink 两跳]
+    Dispatch -->|否| Intra["intranode_dispatch<br/>NVLink chunked 传输"]
+    Dispatch -->|是| Inter["internode_dispatch<br/>RDMA + NVLink 两跳"]
     
     Intra --> Return[返回 recv_x, handle, event]
     Inter --> Return
@@ -312,14 +312,14 @@ Combine 是 dispatch 的逆过程：将 expert 处理后的 token 聚合（reduc
 ```mermaid
 flowchart TD
     A[用户调用 combine] --> B[从 handle 中恢复布局信息]
-    B --> C[cached_notify_combine<br/>barrier + 清理队列 head/tail]
+    B --> C["cached_notify_combine<br/>barrier + 清理队列 head/tail"]
     C --> D[Combine Kernel]
     
     D --> E{internode?}
-    E -->|否| F[intranode_combine<br/>NVLink chunked 传输 + reduce]
-    E -->|是| G[internode_combine<br/>RDMA + NVLink 两跳 + reduce]
+    E -->|否| F["intranode_combine<br/>NVLink chunked 传输 + reduce"]
+    E -->|是| G["internode_combine<br/>RDMA + NVLink 两跳 + reduce"]
     
-    F --> H[输出: combined_x<br/>combined_topk_weights]
+    F --> H["输出: combined_x<br/>combined_topk_weights"]
     G --> H
 ```
 
@@ -404,18 +404,18 @@ flowchart LR
 flowchart TD
     A[low_latency_dispatch] --> B{发送阶段}
     B --> C["Warp Group 0~N-1:<br/>FP8 转换 + RDMA 发送"]
-    B --> D[最后一个 Warp:<br/>统计 expert 计数 + 清理]
+    B --> D["最后一个 Warp:<br/>统计 expert 计数 + 清理"]
     
     C --> C1[读取 token 数据]
     C1 --> C2{use_fp8?}
-    C2 -->|是| C3[计算 per-128-channel amax<br/>转换为 FP8]
+    C2 -->|是| C3["计算 per-128-channel amax<br/>转换为 FP8"]
     C2 -->|否| C4[直接写入 BF16]
     C3 --> C5[写入 RDMA send buffer]
     C4 --> C5
     C5 --> C6[读取 topk_idx 确定 dst_expert]
     C6 --> C7[atomicAdd 获取 slot_idx]
     C7 --> C8{同节点?}
-    C8 -->|是| C9[NVLink 直接写入<br/>UNROLLED_WARP_COPY]
+    C8 -->|是| C9["NVLink 直接写入<br/>UNROLLED_WARP_COPY"]
     C8 -->|否| C10[IBGDA RDMA Put]
     
     D --> D1[统计每个 expert 的 token 数]
@@ -423,9 +423,9 @@ flowchart TD
     D2 --> D3["发送 expert 计数到远端<br/>(AMO 或 NVLink)"]
     
     B --> E{接收阶段}
-    E --> E1[grid sync<br/>(send/recv 同一 kernel)]
-    E1 --> E2[每个 warp group 负责<br/>一个 (expert, src_rank) 对]
-    E2 --> E3[Busy-wait 等待接收计数<br/>(ld_acquire_sys_global)]
+    E --> E1["grid sync<br/>(send/recv 同一 kernel)"]
+    E1 --> E2["每个 warp group 负责<br/>一个 (expert, src_rank) 对"]
+    E2 --> E3["Busy-wait 等待接收计数<br/>(ld_acquire_sys_global)"]
     E3 --> E4[AtomicAdd 获取输出 slot]
     E4 --> E5[Copy 数据到 packed_recv_x]
 ```
@@ -446,7 +446,7 @@ flowchart TD
     A[low_latency_combine] --> B{发送阶段}
     B --> B1[读取 expert 处理后的数据]
     B1 --> B2{use_logfmt?}
-    B2 -->|是| B3[LogFMT 编码<br/>10-bit 压缩]
+    B2 -->|是| B3["LogFMT 编码<br/>10-bit 压缩"]
     B2 -->|否| B4[BF16 直接发送]
     B3 --> B5[RDMA/NVLink 发送到目标 rank]
     B4 --> B5
@@ -454,7 +454,7 @@ flowchart TD
     B --> C{接收阶段}
     C --> C1["等待远端数据到达<br/>(flag-based 同步)"]
     C1 --> C2[读取 src_info 和 layout_range]
-    C2 --> C3[加权 reduce:<br/>topk_weights × 数据]
+    C2 --> C3["加权 reduce:<br/>topk_weights × 数据"]
     C3 --> C4[写入 combined_x]
 ```
 
@@ -518,9 +518,9 @@ graph TD
     end
     
     subgraph "每个 Buffer 包含:"
-        S[Signaling Buffer<br/>num_experts × sizeof(int)]
-        SEND[Send Buffer<br/>max(dispatch, combine) × num_msgs]
-        RECV[Recv Data Buffer<br/>max(dispatch, combine) × num_msgs]
+        S["Signaling Buffer<br/>num_experts × sizeof(int)"]
+        SEND["Send Buffer<br/>max(dispatch, combine) × num_msgs"]
+        RECV["Recv Data Buffer<br/>max(dispatch, combine) × num_msgs"]
     end
     
     B0 --> S
