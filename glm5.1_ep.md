@@ -452,7 +452,7 @@ flowchart TD
     B4 --> B5
     
     B --> C{接收阶段}
-    C --> C1[等待远端数据到达<br/>(flag-based 同步)]
+    C --> C1["等待远端数据到达<br/>(flag-based 同步)"]
     C1 --> C2[读取 src_info 和 layout_range]
     C2 --> C3[加权 reduce:<br/>topk_weights × 数据]
     C3 --> C4[写入 combined_x]
