@@ -420,7 +420,7 @@ flowchart TD
     
     D --> D1[统计每个 expert 的 token 数]
     D1 --> D2[等待本地 RDMA 完成]
-    D2 --> D3[发送 expert 计数到远端<br/>(AMO 或 NVLink)]
+    D2 --> D3["发送 expert 计数到远端<br/>(AMO 或 NVLink)"]
     
     B --> E{接收阶段}
     E --> E1[grid sync<br/>(send/recv 同一 kernel)]
