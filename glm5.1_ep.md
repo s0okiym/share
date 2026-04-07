@@ -695,7 +695,7 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     A[通信超时检测] --> B{是否超时?}
-    B -->|是| C[atomicExch mask_buffer[dst_rank] = 1]
+    B -->|是| C["atomicExch mask_buffer[dst_rank] = 1"]
     C --> D[后续通信跳过被 mask 的 rank]
     B -->|否| E[正常通信]
     
