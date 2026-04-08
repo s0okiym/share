@@ -278,7 +278,7 @@ flowchart LR
     subgraph "客户端"
         A1[生成临时 X25519 密钥对] --> A2["ECDH 计算共享密钥<br/>AuthKey"]
         A2 --> A3[HKDF 扩展密钥]
-        A3 --> A4["AES-GCM 加密<br/>SessionID[:16"]]
+        A3 --> A4["AES-GCM 加密<br/>SessionID[:16]"]
         A4 --> A5[发送 ClientHello]
     end
     
