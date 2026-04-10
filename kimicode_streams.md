@@ -934,11 +934,11 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     Start([Proxy Thread Start]) --> Init[Set CUDA device/context]
-    Init --> Loop{stop == 0 || active != NULL?}
+    Init --> Loop{"stop == 0 || active != NULL?"}
     Loop -->|Yes| Progress[progressOps: call transport proxyProgress]
-    Progress --> CheckIdle{idle or need append?}
+    Progress --> CheckIdle{"idle or need append?"}
     CheckIdle -->|Yes| GetOps[ncclProxyGetPostedOps]
-    GetOps --> HasOps{added > 0?}
+    GetOps --> HasOps{"added > 0?"}
     HasOps -->|Yes| Append[ProxyAppend to active list]
     HasOps -->|No| Yield[std::this_thread::yield]
     CheckIdle -->|No| Loop
