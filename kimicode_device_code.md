@@ -1828,7 +1828,7 @@ flowchart TD
     D --> E[Device: ncclKernelMain]
     E --> F{SpecializedFnId >= 0 && matches?}
     F -->|Yes| G[SpecializedRunWorkBatch::run]
-    F -->|No| H[ncclDevFuncTable[funcId]]
+    F -->|No| H["ncclDevFuncTable[funcId]"]
     G --> I[RunWorkColl<func, T, RedOp, Algo, Proto>::run]
     H --> I
     I --> J[Primitives::send/recv/directSend/directRecv/...]
@@ -1866,7 +1866,7 @@ flowchart TD
     E --> F{P2p == 0?}
     F -->|Yes| G[reduceCopy: apply RedOp]
     F -->|No| H[Skip reduce, direct copy]
-    G --> I{Direct || dstNeedsLoad?}
+    G --> I{"Direct || dstNeedsLoad?"}
     H --> I
     I -->|Yes| J[ScatterGatherOp or direct store]
     I -->|No| K[reduceCopy to dst]
