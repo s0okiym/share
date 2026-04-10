@@ -216,7 +216,7 @@ asm volatile("multimem.ld_reduce.relaxed.sys.global.add.acc::f32.f16x2 %0, [%1];
 graph TD
     A[计算 Hunk 大小<br/>BytePerHunk = Unroll×WARP_SIZE×BytePerPack] --> B[计算本线程偏移]
     B --> C[主循环]
-    C --> D[从 srcs[0] 加载]
+    C --> D["从 srcs[0] 加载"]
     D --> E{MultimemSrcs?}
     E -->|是| F[applyLoadMultimem<br/>硬件归约加载]
     E -->|否| G[ld_volatile_global<br/>volatile加载]
@@ -246,16 +246,16 @@ graph TD
 
 ```mermaid
 graph TD
-    A[reduceCopy] --> B{BigPackSize > sizeof(T)?}
+    A[reduceCopy] --> B{"BigPackSize > sizeof(T)?"}
     B -->|是| C{指针 BigPackSize 对齐?}
-    C -->|是| D[reduceCopyPacks BigPackSize<br/>Unroll展开]
+    C -->|是| D["reduceCopyPacks BigPackSize<br/>Unroll展开"]
     D --> E{还有剩余?}
-    E -->|是| F[reduceCopyPacks BigPackSize<br/>Unroll=1 处理残余]
+    E -->|是| F["reduceCopyPacks BigPackSize<br/>Unroll=1 处理残余"]
     E -->|否| G[返回]
     F --> G
-    C -->|否| H[reduceCopyPacks sizeof(T)<br/>降级到元素大小]
+    C -->|否| H["reduceCopyPacks sizeof(T)<br/>降级到元素大小"]
     B -->|否| H
-    H --> I[reduceCopyPacks sizeof(T)<br/>Unroll=1 处理残余]
+    H --> I["reduceCopyPacks sizeof(T)<br/>Unroll=1 处理残余"]
 ```
 
 ---
@@ -781,17 +781,19 @@ graph TD
 
 ```mermaid
 sequenceDiagram
+    sequenceDiagram
     participant R0 as Rank 0
     participant R1 as Rank 1
     participant R2 as Rank 2
     participant R3 as Rank 3
     
     Note over R0,R3: nranks-1 步，每步发送一个 rank 的数据
-    Step0: R0->>R1: R0 的数据
-    Step1: R1->>R2: R0 的数据 (转发)
-    Step2: R2->>R3: R0 的数据 (转发)
     
-    Note: 每步的 rankDest = ringRanks[nranks - j]
+    R0->>R1: Step0: R0 的数据
+    R1->>R2: Step1: R0 的数据 (转发)
+    R2->>R3: Step2: R0 的数据 (转发)
+    
+    Note over R0,R3: 每步的 rankDest = ringRanks[nranks - j]
 ```
 
 AllGather 只有拷贝操作，没有归约。Ring 算法中每步将一个 rank 的数据沿环传递。
