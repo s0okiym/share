@@ -1205,7 +1205,7 @@ flowchart TD
     G --> I{"event 完成?"}
     H --> I
     I -->|是| J["执行 callback->fn"]
-    I -->|否 (NotReady)| K["停止遍历"]
+    I -->|"否 (NotReady)"| K["停止遍历"]
     J --> C
     K --> E
 ```
