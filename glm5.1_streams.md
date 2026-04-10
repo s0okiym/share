@@ -855,7 +855,7 @@ sequenceDiagram
     participant DS as deviceStream
     participant HS as hostStream
     participant LO as launchOrder
-    participation Proxy as Proxy Progress 线程
+    participant Proxy as Proxy Progress 线程
     participant GPU as GPU Kernel
 
     rect rgb(230,245,255)
