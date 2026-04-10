@@ -781,7 +781,6 @@ graph TD
 
 ```mermaid
 sequenceDiagram
-    sequenceDiagram
     participant R0 as Rank 0
     participant R1 as Rank 1
     participant R2 as Rank 2
@@ -876,9 +875,11 @@ sequenceDiagram
     participant R3 as Rank 3
     
     Note over R0,R3: nranks-1 步 Reduce-Scatter
-    Step0: R0->>R1: 发送 R3 的 chunk
-    Step1: R0<-R1: R2 接收归约转发 (recvReduceSend)
-    Step2: R0<-R1: R1 接收归约拷贝 (recvReduceCopy + postOp)
+    
+    R0->>R1: Step0: 发送 R3 的 chunk
+    R1->>R0: Step1: R2 接收归约转发 (recvReduceSend)
+    R1->>R0: Step2: R1 接收归约拷贝 (recvReduceCopy + postOp)
+    
     Note over R0: R0 的 chunk 归约完成!
 ```
 
