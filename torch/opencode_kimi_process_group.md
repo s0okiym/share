@@ -267,7 +267,6 @@ sequenceDiagram
         Backend-->>PythonAPI: 后端实例
         PythonAPI->>PG: pg._register_backend(device, backend_type, backend)
     end
-    end
     
     PythonAPI->>PythonAPI: _store_based_barrier()
     PythonAPI->>Store: add(barrier_key, 1)
@@ -501,19 +500,17 @@ sequenceDiagram
         Backend->>Backend: enqueue(work)
         Backend->>Gloo: gloo::Allreduce()
     end
-    end
     
     Backend-->>PG: c10::intrusive_ptr<Work>
     PG-->>PythonAPI: Work对象
     
-    alt 异步操作 (asyncOp=True)
+    alt 异步操作 asyncOp=True
         PythonAPI-->>User: 立即返回Work
         User->>Work: work.wait()  # 后续同步
-    else 同步操作 (阻塞)
+    else 同步操作 阻塞
         PythonAPI->>Work: work.wait()
         Work-->>PythonAPI: 完成
         PythonAPI-->>User: 返回
-    end
     end
 ```
 
@@ -806,10 +803,9 @@ sequenceDiagram
         end
     end
     
-    alt 看门狗挂起
+    opt 看门狗挂起检测
         Monitor->>Monitor: 检查心跳超时
         Monitor->>Main: 终止进程
-    end
     end
 ```
 
