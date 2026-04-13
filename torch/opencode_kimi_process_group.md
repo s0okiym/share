@@ -267,6 +267,7 @@ sequenceDiagram
         Backend-->>PythonAPI: 后端实例
         PythonAPI->>PG: pg._register_backend(device, backend_type, backend)
     end
+    end
     
     PythonAPI->>PythonAPI: _store_based_barrier()
     PythonAPI->>Store: add(barrier_key, 1)
@@ -373,9 +374,9 @@ flowchart TD
     A[用户调用init_process_group] --> B[解析BackendConfig]
     B --> C{Backend字符串格式}
     
-    C -->|单后端<br/>如"nccl"| D[创建单后端]
-    C -->|设备:后端对<br/>如"cpu:gloo,cuda:nccl"| E[解析对]
-    C -->|未定义/自动| F[检测加速器<br/>使用默认后端]
+    C -->|"单后端<br/>如'nccl'"| D[创建单后端]
+    C -->|"设备:后端对<br/>如'cpu:gloo,cuda:nccl'"| E[解析对]
+    C -->|"未定义/自动"| F[检测加速器<br/>使用默认后端]
     
     E --> G[为每个device:backend对]
     G --> H{后端类型}
@@ -486,7 +487,7 @@ sequenceDiagram
     PythonAPI->>PG: pg.allreduce([tensor], opts)
     
     PG->>Dispatcher: 分发到c10d::allreduce_
-    Note over Dispatcher: 使用PyTorch分发器<br/>进行后端选择
+    Note over Dispatcher: "使用PyTorch分发器<br/>进行后端选择"
     
     Dispatcher->>Backend: backend->allreduce(tensors, opts)
     
@@ -500,6 +501,7 @@ sequenceDiagram
         Backend->>Backend: enqueue(work)
         Backend->>Gloo: gloo::Allreduce()
     end
+    end
     
     Backend-->>PG: c10::intrusive_ptr<Work>
     PG-->>PythonAPI: Work对象
@@ -511,6 +513,7 @@ sequenceDiagram
         PythonAPI->>Work: work.wait()
         Work-->>PythonAPI: 完成
         PythonAPI-->>User: 返回
+    end
     end
 ```
 
@@ -806,6 +809,7 @@ sequenceDiagram
     alt 看门狗挂起
         Monitor->>Monitor: 检查心跳超时
         Monitor->>Main: 终止进程
+    end
     end
 ```
 
