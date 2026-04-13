@@ -360,7 +360,7 @@ flowchart TD
     G --> H{允许经过 GPU?}
     H -->|仅1跳或 NVL-to-NVL| I["接受路径"]
     H -->|否| J["跳过"]
-    I --> K{新路径更优? (更短 且 BW 更高)}
+    I --> K{"新路径更优? (更短 且 BW 更高)"}
     K -->|是| L["更新路径 + 确定路径类型"]
     K -->|否| M["保留原路径"]
     L --> F
@@ -1736,7 +1736,7 @@ flowchart TD
 ```mermaid
 flowchart TD
     A["NCCL_PARAM 宏生成的 ncclParam##name()"] --> B["原子加载 cache 值"]
-    B --> C{cache == INT64_MIN (未初始化)?}
+    B --> C{"cache == INT64_MIN (未初始化)?"}
     C -->|否| D["直接返回缓存值 (零开销)"]
     C -->|是| E["ncclLoadParam — 互斥锁保护"]
 
