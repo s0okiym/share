@@ -11,6 +11,8 @@
 8. [垃圾回收](#8-垃圾回收)
 9. [Expandable Segments](#9-expandable-segments)
 10. [CUDA Graph支持](#10-cuda-graph支持)
+11. [内存统计与Snapshot](#11-内存统计与snapshot)
+12. [配置选项](#12-配置选项)
 
 ---
 
@@ -20,57 +22,44 @@
 
 | 文件 | 路径 | 描述 |
 |------|------|------|
-| 主实现 | c10/cuda/CUDACachingAllocator.cpp | 核心分配器逻辑 (~4969行) |
+| 主实现 | c10/cuda/CUDACachingAllocator.cpp | 核心分配器逻辑 (~5000行) |
 | 头文件 | c10/cuda/CUDACachingAllocator.h | 公共API和类接口 |
 | 通用接口 | c10/core/CachingDeviceAllocator.h | 基类和统计结构 |
 | CUDA配置 | c10/cuda/CUDAAllocatorConfig.h | CUDA特定配置 |
 | 基础配置 | c10/core/AllocatorConfig.h | 通用分配器配置 |
+| 内存追踪 | c10/core/impl/GPUTrace.h | GPU内存追踪 |
 
 ### 1.2 整体架构
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    User Code                                │
-│              at::empty(), tensor.clone(), etc.              │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    CUDACachingAllocator                     │
-│    - malloc: 分配内存                                       │
-│    - free: 释放内存                                         │
-│    - emptyCache: 清理缓存                                   │
-│    - memory_stats: 统计信息                                 │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    BlockPool                                │
-│    ┌─────────────────┐    ┌─────────────────┐              │
-│    │   small_blocks  │    │   large_blocks  │              │
-│    │   (<= 1MB)      │    │   (> 1MB)       │              │
-│    │   std::set      │    │   std::set      │              │
-│    │   (按大小排序)   │    │   (按大小排序)   │              │
-│    └─────────────────┘    └─────────────────┘              │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Block                                    │
-│    - ptr: 内存地址                                          │
-│    - size: 块大小                                           │
-│    - allocated: 是否已分配                                  │
-│    - prev/next: 分割块链表                                  │
-│    - pool: 所属池                                           │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    CUDA Driver                              │
-│    - cudaMalloc, cudaFree                                   │
-│    - cuMemAddressReserve (expandable)                       │
-│    - cuMemMap, cuMemUnmap                                   │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    A["User Code: at::empty(), tensor.clone(), etc."] --> B["CUDACachingAllocator"]
+    B --> C["malloc: 分配内存"]
+    B --> D["free: 释放内存"]
+    B --> E["emptyCache: 清理缓存"]
+    B --> F["memory_stats: 统计信息"]
+    B --> G["memory_snapshot: 内存快照"]
+    
+    C --> H["BlockPool"]
+    H --> I["small_blocks: <= 1MB"]
+    H --> J["large_blocks: > 1MB"]
+    
+    I --> K["std::set ordered by size"]
+    J --> L["std::set ordered by size"]
+    
+    K --> M["Block"]
+    L --> M
+    
+    M --> N["ptr: 内存地址"]
+    M --> O["size: 块大小"]
+    M --> P["allocated: 是否已分配"]
+    M --> Q["prev/next: 分割块链表"]
+    M --> R["pool: 所属池"]
+    
+    M --> S["CUDA Driver"]
+    S --> T["cudaMalloc, cudaFree"]
+    S --> U["cuMemAddressReserve (expandable)"]
+    S --> V["cuMemMap, cuMemUnmap"]
 ```
 
 ---
@@ -80,18 +69,18 @@
 ### 2.1 Block结构
 
 ```cpp
-// 来自c10/cuda/CUDACachingAllocator.cpp (第196-265行)
+// 来自c10/cuda/CUDACachingAllocator.cpp
 struct Block {
   c10::DeviceIndex device;      // GPU设备索引
   cudaStream_t stream;          // 分配流
   stream_set stream_uses;       // 使用过该块的流
-  int32_t registration_counter{-1};
+  int32_t registration_counter{-1};  // 用于排序
   size_t size;                  // 块大小（字节）
   size_t requested_size;        // 原始请求大小
   BlockPool* pool{nullptr};     // 所属内存池
   void* ptr{nullptr};           // 内存地址
   bool allocated{false};        // 是否已分配
-  bool mapped{true};            // 物理内存映射状态
+  bool mapped{true};            // 物理内存映射状态（expandable segments）
   Block* prev{nullptr};         // 前一个分割块
   Block* next{nullptr};         // 后一个分割块
   int event_count{0};           // 未完成CUDA事件数
@@ -103,37 +92,83 @@ struct Block {
   bool is_split() const {
     return (prev != nullptr) || (next != nullptr);
   }
+  
+  size_t gc_count() {
+    TORCH_INTERNAL_ASSERT(pool);
+    return static_cast<size_t>(pool->get_free_blocks_call_count - gc_count_base);
+  }
 };
 ```
 
 ### 2.2 BlockPool结构
 
 ```cpp
-// 来自c10/cuda/CUDACachingAllocator.cpp (第171-192行)
+// 来自c10/cuda/CUDACachingAllocator.cpp
 struct BlockPool {
   BlockPool(bool small, PrivatePool* private_pool = nullptr)
-      : blocks(BlockComparatorSize),
+      : blocks(BlockComparatorRegistrationCounter),
         unmapped(BlockComparatorAddress),
         is_small(small),
         owner_PrivatePool(private_pool) {}
 
-  std::set<Block*, Comparison> blocks;      // 空闲块，按大小排序
+  std::set<Block*, Comparison> blocks;      // 空闲块，按注册计数器排序
   std::set<Block*, Comparison> unmapped;    // 未映射块（expandable segments）
   const bool is_small;
   PrivatePool* owner_PrivatePool;
   int64_t get_free_blocks_call_count{0};
+  
+  // 插入块时更新gc计数器
+  std::pair<std::set<Block*, Comparison>::iterator, bool> insert_into_blocks(
+      Block* block) {
+    block->gc_count_base = get_free_blocks_call_count;
+    return blocks.insert(block);
+  }
 };
 ```
 
-### 2.3 大小阈值
+### 2.3 大小阈值（已验证）
 
 ```cpp
-// 来自c10/core/AllocatorConfig.h (第15-24行)
+// 来自c10/core/AllocatorConfig.h（已核实）
 constexpr size_t kSmallBuffer = 2097152;     // 2 MiB
 constexpr size_t kMinBlockSize = 512;        // 最小分配大小
 constexpr size_t kSmallSize = 1048576;       // 1 MiB - 小/大块分界
 constexpr size_t kMinLargeAlloc = 10485760;  // 10 MiB
 constexpr size_t kRoundLarge = 2097152;      // 大块舍入粒度（2 MiB）
+
+// 可配置的大块段大小（默认20MB）
+// AcceleratorAllocatorConfig::large_segment_size() 返回 20971520 (20MB)
+```
+
+### 2.4 统计结构
+
+```cpp
+// 来自c10/core/CachingDeviceAllocator.h
+struct DeviceStats {
+  StatArray allocation;          // COUNT: 分配请求
+  StatArray segment;             // COUNT: cudaMalloc段
+  StatArray active;              // COUNT: 活跃内存块
+  StatArray inactive_split;      // COUNT: 非活跃分割块
+  StatArray allocated_bytes;     // SUM: 已分配字节
+  StatArray reserved_bytes;      // SUM: 保留字节
+  StatArray active_bytes;        // SUM: 活跃字节
+  StatArray inactive_split_bytes;// SUM: 非活跃分割字节
+  StatArray requested_bytes;     // SUM: 客户端请求字节
+  StatArray pool_specific;       // 池特定统计
+  
+  int64_t num_alloc_retries = 0;
+  int64_t num_ooms = 0;
+  int64_t num_sync_all_streams = 0;
+  int64_t num_fragmentation = 0;
+};
+
+// 单个统计条目
+struct Stat {
+  int64_t current = 0;    // 当前值
+  int64_t peak = 0;       // 峰值
+  int64_t allocated = 0;  // 累计分配
+  int64_t freed = 0;      // 累计释放
+};
 ```
 
 ---
@@ -143,7 +178,7 @@ constexpr size_t kRoundLarge = 2097152;      // 大块舍入粒度（2 MiB）
 ### 3.1 池选择
 
 ```cpp
-// 来自c10/cuda/CUDACachingAllocator.cpp (第3321-3346行)
+// 来自c10/cuda/CUDACachingAllocator.cpp
 BlockPool& get_pool(size_t size, cudaStream_t stream) {
   // 检查CUDA图捕获池
   if (C10_UNLIKELY(!captures_underway.empty())) {
@@ -171,7 +206,7 @@ BlockPool& get_pool(size_t size, cudaStream_t stream) {
 ### 3.2 大小舍入
 
 ```cpp
-// 来自c10/cuda/CUDACachingAllocator.cpp (第2802-2814行)
+// 来自c10/cuda/CUDACachingAllocator.cpp
 static size_t round_size(size_t size) {
   if (size < kMinBlockSize) {
     return kMinBlockSize;
@@ -186,15 +221,16 @@ static size_t round_size(size_t size) {
 }
 ```
 
-### 3.3 分配大小计算
+### 3.3 分配大小计算（已更新）
 
 ```cpp
-// 来自c10/cuda/CUDACachingAllocator.cpp (第3376-3384行)
+// 来自c10/cuda/CUDACachingAllocator.cpp
 static size_t get_allocation_size(size_t size) {
   if (size <= kSmallSize) {
     return kSmallBuffer;  // 2 MiB for small
   } else if (size < kMinLargeAlloc) {
-    return AcceleratorAllocatorConfig::large_segment_size();  // 20 MiB default
+    // 使用可配置的大块段大小（默认20MB）
+    return AcceleratorAllocatorConfig::large_segment_size();
   } else {
     return kRoundLarge * ((size + kRoundLarge - 1) / kRoundLarge);
   }
@@ -209,32 +245,32 @@ static size_t get_allocation_size(size_t size) {
 
 ```mermaid
 flowchart TD
-    A[malloc size] --> B[Round size to alignment]
-    B --> C[Select Pool]
-    C --> D[Process Events]
-    D --> E[Search Free Block]
+    A["malloc size"] --> B["Round size to alignment"]
+    B --> C["Select Pool"]
+    C --> D["Process Events"]
+    D --> E["Search Free Block"]
     
-    E -->|Found| F[Check Split]
-    E -->|Not Found| G[Try GC]
+    E -->|"Found"| F["Check Split"]
+    E -->|"Not Found"| G["Try GC"]
     
-    G -->|Success| E
-    G -->|Fail| H[Allocate New Block]
+    G -->|"Success"| E
+    G -->|"Fail"| H["Allocate New Block"]
     
-    H -->|Success| F
-    H -->|Fail| I[OOM Retry Chain]
+    H -->|"Success"| F
+    H -->|"Fail"| I["OOM Retry Chain"]
     
-    I -->|Success| F
-    I -->|Fail| J[Throw OOM Error]
+    I -->|"Success"| F
+    I -->|"Fail"| J["Throw OOM Error"]
     
-    F -->|Should Split| K[Split Block]
-    F -->|No Split| L[Use Entire Block]
+    F -->|"Should Split"| K["Split Block"]
+    F -->|"No Split"| L["Use Entire Block"]
     
-    K --> M[alloc_found_block]
+    K --> M["alloc_found_block"]
     L --> M
     
-    M --> N[Update Stats]
-    N --> O[Add to active_blocks]
-    O --> P[Return Block.ptr]
+    M --> N["Update Stats"]
+    N --> O["Add to active_blocks"]
+    O --> P["Return Block.ptr"]
 ```
 
 ### 4.2 核心分配代码
@@ -285,6 +321,8 @@ void* CUDACachingAllocator::malloc(int device, size_t size, cudaStream_t stream)
 ```cpp
 Block* get_free_block(size_t size, cudaStream_t stream, BlockPool* pool) {
   // 使用best-fit策略在有序集合中查找
+  // 构造搜索key
+  Block key{device, stream, size};
   auto it = pool->blocks.lower_bound(&key);
   
   // 遍历找到合适的块
@@ -309,30 +347,30 @@ Block* get_free_block(size_t size, cudaStream_t stream, BlockPool* pool) {
 
 ```mermaid
 flowchart TD
-    A[free ptr] --> B[Find Block]
-    B --> C[Update Statistics]
-    C --> D[Check Stream Uses]
+    A["free ptr"] --> B["Find Block"]
+    B --> C["Update Statistics"]
+    C --> D["Check Stream Uses"]
     
-    D -->|Multiple Streams| E[Check Capture Status]
-    D -->|Single Stream| F[Direct free_block]
+    D -->|"Multiple Streams"| E["Check Capture Status"]
+    D -->|"Single Stream"| F["Direct free_block"]
     
-    E -->|In Capture| G[Deferred Free]
-    E -->|Not Capturing| H[insert_events]
+    E -->|"In Capture"| G["Deferred Free"]
+    E -->|"Not Capturing"| H["insert_events"]
     
-    H --> I[Add to cuda_events queue]
+    H --> I["Add to cuda_events queue"]
     
-    F --> J[Remove from active_blocks]
-    J --> K[Check Merge Candidates]
+    F --> J["Remove from active_blocks"]
+    J --> K["Check Merge Candidates"]
     
-    K --> L[try_merge_blocks]
-    L -->|Merge with prev| M[Merge prev block]
-    L -->|Merge with next| N[Merge next block]
+    K --> L["try_merge_blocks"]
+    L -->|"Merge with prev"| M["Merge prev block"]
+    L -->|"Merge with next"| N["Merge next block"]
     
-    M --> O[Return to pool]
+    M --> O["Return to pool"]
     N --> O
     
-    G --> P[record_free_markers]
-    P --> Q[Add to deferred_blocks]
+    G --> P["record_free_markers"]
+    P --> Q["Add to deferred_blocks"]
 ```
 
 ### 5.2 释放核心代码
@@ -379,7 +417,7 @@ void free_block(Block* block) {
 ### 6.1 分割决策
 
 ```cpp
-// 来自c10/cuda/CUDACachingAllocator.cpp (第3356-3374行)
+// 来自c10/cuda/CUDACachingAllocator.cpp
 bool should_split(const Block* block, size_t size, bool is_expandable_segments_active) {
   // 检查池是否标记为不可分割
   if (no_split_pools.find(block->pool->owner_MempoolId()) != no_split_pools.end()) {
@@ -399,7 +437,7 @@ bool should_split(const Block* block, size_t size, bool is_expandable_segments_a
 ### 6.2 合并块
 
 ```cpp
-// 来自c10/cuda/CUDACachingAllocator.cpp (第3288-3319行)
+// 来自c10/cuda/CUDACachingAllocator.cpp
 size_t try_merge_blocks(Block* dst, Block* src, BlockPool& pool) {
   // 无法合并的条件
   if (!src || src->allocated || src->event_count > 0 ||
@@ -436,24 +474,24 @@ size_t try_merge_blocks(Block* dst, Block* src, BlockPool& pool) {
 ```mermaid
 flowchart TD
     subgraph Splitting
-        A[Found free block] --> B[Size = 20MB]
-        B --> C[Need = 8MB]
-        C --> D[should_split?]
-        D -->|Check no_split_pool| E[Check remaining >= kMinBlockSize]
-        E -->|Yes| F[alloc_found_block with split]
-        F --> G[Create new Block for allocation]
-        G --> H[Update remaining block]
-        H --> I[Update statistics]
+        A["Found free block"] --> B["Size = 20MB"]
+        B --> C["Need = 8MB"]
+        C --> D["should_split?"]
+        D -->|"Check no_split_pool"| E["Check remaining >= kMinBlockSize"]
+        E -->|"Yes"| F["alloc_found_block with split"]
+        F --> G["Create new Block for allocation"]
+        G --> H["Update remaining block"]
+        H --> I["Update statistics"]
     end
     
     subgraph Coalescing
-        J[free_block] --> K[Remove from active_blocks]
-        K --> L[Check merge candidates]
-        L --> M[try_merge_blocks]
-        M -->|Conditions met| N[Merge [prev block][this block]]
-        N --> O[prev->size += this->size]
-        O --> P[Delete this block]
-        P --> Q[Update statistics]
+        J["free_block"] --> K["Remove from active_blocks"]
+        K --> L["Check merge candidates"]
+        L --> M["try_merge_blocks"]
+        M -->|"Conditions met"| N["Merge [prev block][this block]"]
+        N --> O["prev->size += this->size"]
+        O --> P["Delete this block"]
+        P --> Q["Update statistics"]
     end
 ```
 
@@ -465,28 +503,28 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[alloc_block fails] --> B[cudaErrorMemoryAllocation]
-    B --> C[Check oom_rejection_info.rejected]
+    A["alloc_block fails"] --> B["cudaErrorMemoryAllocation"]
+    B --> C["Check oom_rejection_info.rejected"]
     
-    C -->|Yes| D[Return nullptr]
-    C -->|No| E[Normal Retry Chain]
+    C -->|"Yes"| D["Return nullptr"]
+    C -->|"No"| E["Normal Retry Chain"]
     
-    E --> F[try_mempool_fallback]
-    F -->|Success| G[Use block from pool]
-    F -->|Fail| H[release_available_cached_blocks]
+    E --> F["try_mempool_fallback"]
+    F -->|"Success"| G["Use block from pool"]
+    F -->|"Fail"| H["release_available_cached_blocks"]
     
-    H -->|Success| I[Retry alloc]
-    H -->|Fail| J[release_cached_blocks]
+    H -->|"Success"| I["Retry alloc"]
+    H -->|"Fail"| J["release_cached_blocks"]
     
-    J -->|Success| I
-    J -->|Fail| K[All retries failed]
+    J -->|"Success"| I
+    J -->|"Fail"| K["All retries failed"]
     
-    K --> L[OOM Error Reporting]
-    L --> M[Get free/total from cudaMemGetInfo]
-    M --> N[Calculate stats]
-    N --> O[Call oom_observers]
-    O --> P[Format error message]
-    P --> Q[Throw OutOfMemoryError]
+    K --> L["OOM Error Reporting"]
+    L --> M["Get free/total from cudaMemGetInfo"]
+    M --> N["Calculate stats"]
+    N --> O["Call oom_observers"]
+    O --> P["Format error message"]
+    P --> Q["Throw OutOfMemoryError"]
 ```
 
 ### 7.2 OOM错误报告
@@ -497,6 +535,26 @@ flowchart TD
 "GPU Y has Z MiB total capacity. "
 "Allocated A MiB, reserved B MiB. "
 "CUDACachingAllocator stats: ..."
+
+// 调用OOM Observers
+void notifyOfOOM(const std::vector<std::pair<std::string, std::string>>& stats) {
+  for (auto& observer : oom_observers_) {
+    observer(stats);
+  }
+}
+```
+
+### 7.3 OOM Observer机制（新增）
+
+```cpp
+// 注册OOM回调
+void registerOOMObserver(std::function<void(
+    const std::vector<std::pair<std::string, std::string>>&)> observer);
+
+// 使用场景：
+// 1. 记录OOM事件到日志
+// 2. 发送告警
+// 3. 触发内存分析
 ```
 
 ---
@@ -506,18 +564,23 @@ flowchart TD
 ### 8.1 GC机制
 
 ```cpp
-// 来自c10/cuda/CUDACachingAllocator.cpp (第3455-3512行)
+// 来自c10/cuda/CUDACachingAllocator.cpp
 void garbage_collect_cached_blocks(const std::shared_ptr<GatheredContext>& context) {
-  // 计算阈值
-  size_t gc_threshold = static_cast<size_t>(
-      AcceleratorAllocatorConfig::garbage_collection_threshold() *
-      static_cast<double>(allowed_memory_maximum.value()));
+  // 获取配置阈值
+  double gc_threshold = AcceleratorAllocatorConfig::garbage_collection_threshold();
+  if (gc_threshold <= 0) {
+    return;  // GC已禁用
+  }
   
-  if (total_allocated_memory <= gc_threshold) {
+  // 计算阈值（字节）
+  size_t gc_threshold_bytes = static_cast<size_t>(
+      gc_threshold * static_cast<double>(allowed_memory_maximum.value()));
+  
+  if (total_allocated_memory <= gc_threshold_bytes) {
     return;  // 无需GC
   }
   
-  const auto target_size = total_allocated_memory - gc_threshold;
+  const auto target_size = total_allocated_memory - gc_threshold_bytes;
   
   // 计算可释放块的平均年龄
   size_t total_age = 0.0;
@@ -528,6 +591,8 @@ void garbage_collect_cached_blocks(const std::shared_ptr<GatheredContext>& conte
       ++freeable_block_count;
     }
   }
+  
+  if (freeable_block_count == 0) return;
   
   double age_threshold = static_cast<double>(total_age) / freeable_block_count;
   
@@ -543,6 +608,16 @@ void garbage_collect_cached_blocks(const std::shared_ptr<GatheredContext>& conte
 }
 ```
 
+### 8.2 GC配置
+
+```cpp
+// 通过环境变量配置
+// PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.5
+
+// 表示当使用内存超过50%最大允许内存时触发GC
+// 默认值为0（禁用GC）
+```
+
 ---
 
 ## 9. Expandable Segments
@@ -551,10 +626,15 @@ void garbage_collect_cached_blocks(const std::shared_ptr<GatheredContext>& conte
 
 Expandable Segments允许分配器预留大的虚拟地址空间，按需映射物理页面，减少碎片。
 
+**配置启用**：
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+
 ### 9.2 ExpandableSegment结构
 
 ```cpp
-// 来自c10/cuda/CUDACachingAllocator.cpp (第376-966行)
+// 来自c10/cuda/CUDACachingAllocator.cpp
 struct ExpandableSegment {
   // 映射虚拟地址范围到物理内存
   SegmentRange map(SegmentRange range);
@@ -569,6 +649,9 @@ struct ExpandableSegment {
   static std::unique_ptr<ExpandableSegment> fromShared(...);
   
   // 使用CUDA驱动的cuMemAddressReserve, cuMemCreate, cuMemMap
+  CUdeviceptr device_ptr_;
+  size_t size_;
+  size_t allocated_size_;
 };
 ```
 
@@ -612,7 +695,7 @@ Block* try_allocate_expandable_block(
 ### 10.1 PrivatePool
 
 ```cpp
-// 来自c10/cuda/CUDACachingAllocator.cpp (第1119-1162行)
+// 来自c10/cuda/CUDACachingAllocator.cpp
 struct PrivatePool {
   MempoolId_t id;
   int use_count{1};           // 使用该池的图数量
@@ -620,6 +703,10 @@ struct PrivatePool {
   std::shared_ptr<CUDAAllocator> allocator_;
   BlockPool large_blocks;
   BlockPool small_blocks;
+  
+  // 额外的统计信息
+  int64_t allocated_bytes = 0;
+  int64_t reserved_bytes = 0;
 };
 ```
 
@@ -629,6 +716,17 @@ struct PrivatePool {
 void beginAllocateToPool(MempoolId_t mempool_id, std::function<bool(cudaStream_t)> filter);
 void endAllocateToPool(MempoolId_t mempool_id);
 void releasePool(MempoolId_t mempool_id);  // 图销毁时调用
+
+// 使用示例（来自CUDAGraph）
+void capture_begin() {
+  allocator->beginAllocateToPool(mempool_id_, [this](cudaStream_t stream) {
+    return stream == capture_stream_;
+  });
+}
+
+void capture_end() {
+  allocator->endAllocateToPool(mempool_id_);
+}
 ```
 
 ### 10.3 延迟释放
@@ -637,53 +735,143 @@ void releasePool(MempoolId_t mempool_id);  // 图销毁时调用
 // 捕获期间，cudaEventQuery是非法的，使用图节点标记延迟释放
 void record_free_markers(Block* block);
 void add_to_deferred_blocks(Block* block);
+
 // 捕获结束后释放
+cudaGraphNode_t free_node;
+cudaGraphAddMemFreeNode(&free_node, graph, &dependencies, dep_count, block->ptr);
 ```
 
 ---
 
-## 11. 配置选项
+## 11. 内存统计与Snapshot
 
-### 11.1 关键设置
+### 11.1 Memory Snapshot API（新增）
 
-| 选项 | 默认值 | 描述 |
-|------|--------|------|
-| max_split_size_mb | 无限制 | 可分割的最大块大小 |
-| max_non_split_rounding_mb | 0 | 超大块的舍入容差 |
-| garbage_collection_threshold | 0 | GC触发阈值（0-1） |
-| expandable_segments | false | 启用可扩展段 |
-| roundup_power2_divisions | [] | 大小舍入除数 |
-| per_process_memory_fraction | 1.0 | 内存使用限制 |
-| throw_on_cudamalloc_oom | false | 预抢占OOM拒绝 |
-| graph_capture_record_stream_reuse | false | 启用流重用优化 |
+```python
+import torch
+
+# 记录内存快照
+snapshot = torch.cuda.memory_snapshot()
+
+# snapshot是一个列表，包含每个块的详细信息：
+# - address: 内存地址
+# - size: 块大小
+# - state: 状态（active, inactive_split, pool）
+# - allocated_size: 实际分配大小
+# - requested_size: 请求大小
+# - stream: 分配流
+# - frames: 分配时的调用栈
+```
+
+### 11.2 内存统计Python API
+
+```python
+import torch
+
+# 获取设备统计
+torch.cuda.memory_stats(device=None)
+# 返回包含以下信息的字典：
+# - allocated_bytes: 已分配字节数
+# - reserved_bytes: 保留字节数
+# - active_bytes: 活跃字节数
+# - num_alloc_retries: 分配重试次数
+# - num_ooms: OOM次数
+
+# 获取内存摘要
+torch.cuda.memory_summary(device=None, abbreviated=False)
+
+# 重置峰值统计
+torch.cuda.reset_peak_memory_stats(device=None)
+
+# 清空缓存
+torch.cuda.empty_cache()
+```
+
+### 11.3 GatheredContext（新增）
+
+```cpp
+// 用于内存调试，记录分配时的调用栈
+struct GatheredContext {
+  std::vector<std::string> cpp_frames;
+  std::vector<std::string> python_frames;
+  
+  static std::shared_ptr<GatheredContext> gather() {
+    // 收集C++和Python调用栈
+  }
+};
+
+// 在分配时记录上下文
+block->context_when_allocated = GatheredContext::gather();
+```
 
 ---
 
-## 12. 内存统计
+## 12. 配置选项
 
-### 12.1 DeviceStats
+### 12.1 关键设置（已更新）
+
+| 选项 | 环境变量 | 默认值 | 描述 |
+|------|----------|--------|------|
+| max_split_size_mb | PYTORCH_CUDA_ALLOC_CONF | unlimited | 可分割的最大块大小 |
+| max_non_split_rounding_mb | PYTORCH_CUDA_ALLOC_CONF | 0 | 超大块的舍入容差 |
+| garbage_collection_threshold | PYTORCH_CUDA_ALLOC_CONF | 0 | GC触发阈值（0-1） |
+| expandable_segments | PYTORCH_CUDA_ALLOC_CONF | false | 启用可扩展段 |
+| roundup_power2_divisions | PYTORCH_CUDA_ALLOC_CONF | [] | 大小舍入除数 |
+| per_process_memory_fraction | PYTORCH_CUDA_ALLOC_CONF | 1.0 | 内存使用限制 |
+| large_segment_size_mb | PYTORCH_CUDA_ALLOC_CONF | 20 | 大块段大小（MB） |
+
+### 12.2 配置示例
+
+```bash
+# 启用垃圾回收和可扩展段
+export PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.5,expandable_segments:True"
+
+# 配置大小舍入
+export PYTORCH_CUDA_ALLOC_CONF="roundup_power2_divisions:[64:8,256:4,1024:4,>:1]"
+
+# 限制最大分割大小
+export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:1024"
+
+# 组合多个选项
+export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:512,garbage_collection_threshold:0.8,expandable_segments:True"
+```
+
+### 12.3 配置解析器
 
 ```cpp
-struct DeviceStats {
-  StatArray allocation;          // COUNT: 分配请求
-  StatArray segment;             // COUNT: cudaMalloc段
-  StatArray active;              // COUNT: 活跃内存块
-  StatArray inactive_split;      // COUNT: 非活跃分割块
-  StatArray allocated_bytes;     // SUM: 已分配字节
-  StatArray reserved_bytes;      // SUM: 保留字节
-  StatArray active_bytes;        // SUM: 活跃字节
-  StatArray inactive_split_bytes;// SUM: 非活跃分割字节
-  StatArray requested_bytes;     // SUM: 客户端请求字节
+// 来自c10/core/AllocatorConfig.h
+class ConfigTokenizer {
+  // 解析格式: "key1:val1,key2:[val2,val3]"
+  // 支持列表值: "key:[v1,v2,v3]"
+  // 示例: "max_split_size_mb:100,garbage_collection_threshold:0.5"
+};
+
+// CUDA特定配置
+class CUDAAllocatorConfig {
+  static void parseArgs(const std::string& env);
   
-  int64_t num_alloc_retries = 0;
-  int64_t num_ooms = 0;
-  int64_t num_sync_all_streams = 0;
+  // CUDA特定选项:
+  // - expandable_segments
+  // - release_lock_on_malloc
 };
 ```
 
 ---
 
-## 13. 总结
+## 13. 文件位置汇总
+
+| 组件 | 文件路径 |
+|------|----------|
+| 主实现 | c10/cuda/CUDACachingAllocator.cpp |
+| 头文件 | c10/cuda/CUDACachingAllocator.h |
+| 基类 | c10/core/CachingDeviceAllocator.h |
+| 通用配置 | c10/core/AllocatorConfig.h |
+| CUDA配置 | c10/cuda/CUDAAllocatorConfig.h |
+| GPU追踪 | c10/core/impl/GPUTrace.h |
+
+---
+
+## 14. 总结
 
 PyTorch的CUDA Caching Allocator是一个精密的GPU内存管理系统：
 
@@ -693,16 +881,21 @@ PyTorch的CUDA Caching Allocator是一个精密的GPU内存管理系统：
 
 3. **分割合并**：动态分割大块，释放时自动合并相邻块
 
-4. **OOM处理**：多层重试机制，包括GC、释放缓存块
+4. **OOM处理**：多层重试机制，包括GC、释放缓存块、OOM Observers
 
-5. **Expandable Segments**：虚拟内存管理，减少碎片
+5. **Expandable Segments**：虚拟内存管理，减少碎片，支持配置启用
 
 6. **CUDA Graph支持**：PrivatePool管理图内存，延迟释放
 
-7. **统计和调试**：详细的内存统计和追踪功能
+7. **统计和调试**：详细的内存统计、内存快照、调用栈追踪
+
+8. **灵活配置**：通过环境变量动态配置分配器行为
+
+9. **垃圾回收**：基于年龄的GC策略，可配置触发阈值
 
 该分配器成功平衡了：
 - **性能**：快速分配，避免频繁cudaMalloc
 - **内存效率**：块重用，合并分割
-- **稳定性**：OOM优雅处理
-- **灵活性**：支持多种使用场景（标准训练、CUDA图、多流）
+- **稳定性**：OOM优雅处理，多种重试策略
+- **灵活性**：支持多种使用场景（标准训练、CUDA图、多流、Expandable Segments）
+- **可调试性**：内存快照、统计信息、调用栈追踪
