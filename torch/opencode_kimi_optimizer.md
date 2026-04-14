@@ -816,23 +816,18 @@ class Adam(Optimizer):
 flowchart TD
     subgraph "SGD"
         S1[计算梯度] --> S2[应用动量]
-        S2 --> S3[更新参数
-θ -= lr * (momentum_buffer)]
+        S2 --> S3["更新参数θ -= lr * (momentum_buffer)"]
     end
 
     subgraph "Adam"
-        A1[计算梯度] --> A2[更新一阶矩
-m = β1*m + (1-β1)*g]
-        A2 --> A3[更新二阶矩
-v = β2*v + (1-β2)*g²]
+        A1[计算梯度] --> A2["更新一阶矩m = β1*m + (1-β1)*g"]
+        A2 --> A3["更新二阶矩v = β2*v + (1-β2)*g²"]
         A3 --> A4[偏差修正]
-        A4 --> A5[更新参数
-θ -= lr * m/(√v + ε)]
+        A4 --> A5["更新参数θ -= lr * m/(√v + ε)"]
     end
 
     subgraph "AdamW"
-        W1[计算梯度] --> W2[权重衰减
-θ -= lr * λ * θ]
+        W1[计算梯度] --> W2["权重衰减θ -= lr * λ * θ"]
         W2 --> W3[Adam更新]
     end
 ```
