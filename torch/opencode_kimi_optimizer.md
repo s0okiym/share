@@ -198,15 +198,15 @@ flowchart TD
     A --> C[组2]
     A --> D[组N]
 
-    B --> B1[params: [p1, p2, p3]]
-    B --> B2[lr: 0.01]
-    B --> B3[momentum: 0.9]
-    B --> B4[weight_decay: 0.0001]
+    B --> B1["params: [p1, p2, p3]"]
+    B --> B2["lr: 0.01"]
+    B --> B3["momentum: 0.9"]
+    B --> B4["weight_decay: 0.0001"]
 
-    C --> C1[params: [p4, p5]]
-    C --> C2[lr: 0.001]
-    C --> C3[momentum: 0.95]
-    C --> C4[weight_decay: 0.001]
+    C --> C1["params: [p4, p5]"]
+    C --> C2["lr: 0.001"]
+    C --> C3["momentum: 0.95"]
+    C --> C4["weight_decay: 0.001"]
 ```
 
 ---
