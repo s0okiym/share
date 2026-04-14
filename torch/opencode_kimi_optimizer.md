@@ -38,18 +38,14 @@
 flowchart TD
     subgraph "训练迭代"
         A[前向传播] --> B[计算损失]
-        B --> C[反向传播
-计算梯度]
-        C --> D[optimizer.step
-更新参数]
+        B --> C["反向传播<br/>计算梯度"]
+        C --> D["optimizer.step<br/>更新参数"]
     end
 
     subgraph "Optimizer内部"
         D --> D1[遍历参数组]
-        D1 --> D2[计算更新量
-动量/自适应学习率]
-        D2 --> D3[应用更新
-param -= lr * grad]
+        D1 --> D2["计算更新量<br/>动量/自适应学习率"]
+        D2 --> D3["应用更新<br/>param -= lr * grad"]
     end
 
     subgraph "学习率调度"

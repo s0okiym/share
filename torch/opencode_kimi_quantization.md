@@ -129,23 +129,18 @@ QAT]
 ```mermaid
 flowchart LR
     subgraph "Per-Tensor 每张量"
-        A1[Tensor<br/>shape=[C,H,W]] --> B1[单个scale
-zero_point]
-        B1 --> C1[整个张量共享
-相同量化参数]
+        A1[Tensor<br/>shape=[C,H,W]] --> B1["单个scale<br/>zero_point"]
+        B1 --> C1["整个张量共享<br/>相同量化参数"]
     end
 
     subgraph "Per-Channel 每通道"
-        A2[Tensor<br/>shape=[C,H,W]] --> B2[C个scale
-C个zero_point]
-        B2 --> C2[每个通道独立
-量化参数]
+        A2[Tensor<br/>shape=[C,H,W]] --> B2["C个scale<br/>C个zero_point"]
+        B2 --> C2["每个通道独立<br/>量化参数"]
     end
 
     subgraph "Per-Token 每词元"
         A3[Tensor<br/>shape=[B,S,H]] --> B3[B*S个scale]
-        B3 --> C3[常用于LLM
-动态量化]
+        B3 --> C3["常用于LLM<br/>动态量化"]
     end
 ```
 
@@ -332,9 +327,9 @@ flowchart TD
     A[输入FP32] --> B[Observer统计]
     B --> C[计算scale/zero_point]
 
-    C --> D[FakeQuantize]
-    D --> E[量化: round(x/scale + zp)]
-    E --> F[反量化: (int - zp) * scale]
+    C --> D["FakeQuantize"]
+    D --> E["量化: round(x/scale + zp)"]
+    E --> F["反量化: (int - zp) * scale"]
     F --> G[输出FP32]
 
     G --> H[模拟量化误差]
@@ -467,12 +462,9 @@ flowchart TD
     C --> C3[权重量化特殊处理]
 
     subgraph "预定义QConfig"
-        D[default_qconfig] --> E[activation=default_observer
-weight=default_weight_observer]
-        F[default_qat_qconfig] --> G[activation=default_fake_quant
-weight=default_weight_fake_quant]
-        H[default_dynamic_qconfig] --> I[activation=default_dynamic_quant_observer
-weight=default_weight_observer]
+        D[default_qconfig] --> E["activation=default_observer<br/>weight=default_weight_observer"]
+        F[default_qat_qconfig] --> G["activation=default_fake_quant<br/>weight=default_weight_fake_quant"]
+        H[default_dynamic_qconfig] --> I["activation=default_dynamic_quant_observer<br/>weight=default_weight_observer"]
     end
 ```
 

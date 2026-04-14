@@ -145,8 +145,8 @@ class autocast:
 ```mermaid
 flowchart LR
     subgraph "操作分类"
-        A[FP16/BF16白名单] --> A1[matmul]
-        A --> A2[conv1d/2d/3d]
+        A["FP16/BF16白名单"] --> A1[matmul]
+        A --> A2["conv1d/2d/3d"]
         A --> A3[linear]
         A --> A4[大部分激活函数]
 
@@ -267,7 +267,7 @@ stateDiagram-v2
     STEPPED --> READY: update()
 
     subgraph "缩放调整逻辑"
-        A[检测Inf/NaN] -->|发现| B[scale *= backoff_factor]
+        A["检测Inf/NaN"] -->|发现| B["scale *= backoff_factor"]
         A -->|未发现| C{连续无Inf?}
         C -->|是(growth_interval)| D[scale *= growth_factor]
         C -->|否| E[保持scale]

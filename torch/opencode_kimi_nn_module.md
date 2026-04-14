@@ -169,7 +169,7 @@ class Module:
 
 ```mermaid
 flowchart TD
-    A[model(input)] --> B[__call__方法]
+    A["model(input)"] --> B["__call__方法"]
     B --> C[调用forward_pre_hooks]
     C --> D[forward方法]
     D --> E[实际计算逻辑]
@@ -571,7 +571,7 @@ model.conv1.register_forward_pre_hook(pre_hook)
 
 ```mermaid
 flowchart TD
-    A[model.to(device)] --> B[遍历所有参数]
+    A["model.to(device)"] --> B[遍历所有参数]
     B --> C[遍历所有缓冲区]
     C --> D[递归处理子模块]
 

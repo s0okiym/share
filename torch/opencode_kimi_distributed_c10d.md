@@ -40,7 +40,7 @@
 ```mermaid
 flowchart TD
     subgraph "分布式训练栈"
-        A[PyTorch Distributed] --> B[DDP / FSDP]
+        A["PyTorch Distributed"] --> B["DDP / FSDP"]
         B --> C[c10d通信层]
 
         subgraph "c10d核心组件"
@@ -50,7 +50,7 @@ flowchart TD
             C --> G[Store协调存储]
         end
 
-        D --> H[NCCL/Gloo/MPI]
+        D --> H["NCCL/Gloo/MPI"]
         H --> I[网络通信层]
     end
 
@@ -191,7 +191,7 @@ flowchart TD
 
     B --> B1[TCP服务器]
     B --> B2[多客户端]
-    B --> B3[主/副模式]
+    B --> B3["主/副模式"]
 
     C --> C1[文件锁]
     C --> C2[引用计数]
@@ -256,8 +256,8 @@ flowchart LR
     B -->|"prefix = 'pg_1'"| C[键名转换]
     C -->|"set('pg_1/key', value)"| D[底层Store]
 
-    E[多ProcessGroup隔离] --> F[PrefixStore: pg_1/]
-    E --> G[PrefixStore: pg_2/]
+    E[多ProcessGroup隔离] --> F["PrefixStore: pg_1/"]
+    E --> G["PrefixStore: pg_2/"]
     F --> H[共享Store]
     G --> H
 ```

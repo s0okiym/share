@@ -1,49 +1,81 @@
-# PyTorch Dispatch System深度分析
+# PyTorch Dispatch System 深度分析
 
 ## 目录
-1. [架构概览](#1-架构概览)
+1. [架构概览与设计原理](#1-架构概览与设计原理)
 2. [DispatchKey详解](#2-dispatchkey详解)
 3. [DispatchKeySet机制](#3-dispatchkeyset机制)
-4. [Dispatch Table](#4-dispatch-table)
-5. [Dispatcher实现](#5-dispatcher实现)
-6. [Dispatch Key提取](#6-dispatch-key提取)
-7. [Boxing与Unboxing](#7-boxing与unboxing)
-8. [Python Dispatch集成](#8-python-dispatch集成)
-9. [Composite与Alias Keys](#9-composite与alias-keys)
-10. [Functorch动态层](#10-functorch动态层)
+4. [Dispatch Table结构与索引计算](#4-dispatch-table结构与索引计算)
+5. [Dispatcher核心实现](#5-dispatcher核心实现)
+6. [OperatorEntry内核管理](#6-operatorentry内核管理)
+7. [Dispatch Key提取机制](#7-dispatch-key提取机制)
+8. [Backend Fallback机制](#8-backend-fallback机制)
+9. [Boxing与Unboxing](#9-boxing与unboxing)
+10. [Python Dispatch集成](#10-python-dispatch集成)
+11. [Composite与Alias Keys](#11-composite与alias-keys)
+12. [线程安全与性能优化](#12-线程安全与性能优化)
 
 ---
 
-## 1. 架构概览
+## 1. 架构概览与设计原理
 
-### 1.1 核心文件位置
+### 1.1 设计目标
+
+PyTorch Dispatch System的设计目标是提供一个**高效、可扩展、线程安全**的算子分发机制：
+
+1. **多态分发**：根据输入张量的设备类型（CPU/CUDA）、数据类型（Dense/Sparse/Quantized）自动选择正确的内核实现
+2. **零开销抽象**：运行时分发开销最小化（通常只需几次位运算和数组索引）
+3. **可扩展性**：支持新后端（如XPU、PrivateUse）和功能（如Autograd、Functionalize）的无缝集成
+4. **线程安全**：支持多线程并发调用而不需要全局锁
+
+### 1.2 核心文件位置
 
 | 组件 | 文件路径 | 描述 |
 |------|----------|------|
-| DispatchKey | c10/core/DispatchKey.h | 分发键定义 |
-| DispatchKeySet | c10/core/DispatchKeySet.h | 分发键集合实现 |
-| Dispatcher | aten/src/ATen/core/dispatch/Dispatcher.h | 主分发器 |
-| OperatorEntry | aten/src/ATen/core/dispatch/OperatorEntry.h | 操作符条目管理 |
-| KernelFunction | aten/src/ATen/core/boxing/KernelFunction.h | 内核函数包装 |
-| Boxing | aten/src/ATen/core/boxing/impl/boxing.h | 装箱工具 |
+| DispatchKey | `c10/core/DispatchKey.h` | 分发键枚举定义 |
+| DispatchKeySet | `c10/core/DispatchKeySet.h` | 64位位集实现 |
+| Dispatcher | `aten/src/ATen/core/dispatch/Dispatcher.h` | 主分发器单例 |
+| OperatorEntry | `aten/src/ATen/core/dispatch/OperatorEntry.h` | 算子条目与分发表 |
+| DispatchKeyExtractor | `aten/src/ATen/core/dispatch/DispatchKeyExtractor.h` | 从参数提取dispatch key |
+| KernelFunction | `aten/src/ATen/core/boxing/KernelFunction.h` | 内核函数包装器 |
+| Boxing | `aten/src/ATen/core/boxing/impl/boxing.h` | 装箱/拆箱工具 |
 
-### 1.2 整体架构
+### 1.3 整体架构流程
 
 ```mermaid
 flowchart TD
-    A["User Code: at::add(tensor_a, tensor_b)"] --> B["Dispatcher::call()"]
-    B --> C["1. Extract DispatchKeySet from arguments"]
-    C --> D["2. Lookup kernel in dispatch table"]
-    D --> E["3. Call kernel function"]
-    E --> F["Dispatch Table Lookup"]
-    F --> G["Compute dispatch key set from tensors"]
-    G --> H["Get highest priority key"]
-    H --> I["Compute table index"]
-    I --> J["Return KernelFunction"]
-    J --> K["KernelFunction::call()"]
-    K --> L["Boxed or Unboxed call"]
-    L --> M["Execute backend-specific implementation"]
+    subgraph "用户代码层"
+        A["User Code: at::add(tensor_a, tensor_b)"] --> B["C++ API Stub"]
+    end
+
+    subgraph "Dispatcher核心层"
+        B --> C["Dispatcher::call()"]
+        C --> D["DispatchKeyExtractor::getDispatchKeySetUnboxed()"]
+        D --> E["从参数提取DispatchKeySet"]
+        E --> F["OperatorEntry::lookup()"]
+        F --> G["计算DispatchKeySet的运行时索引"]
+        G --> H["从dispatchTable_获取KernelFunction"]
+    end
+
+    subgraph "内核执行层"
+        H --> I["KernelFunction::call()"]
+        I --> J["Unboxed调用（直接C++调用）"]
+        I --> K["Boxed调用（通过IValue栈）"]
+        J --> L["执行后端特定实现<br/>如at::native::add_cpu"]
+        K --> L
+    end
 ```
+
+### 1.4 关键设计决策
+
+**为什么使用位集（Bitset）？**
+- 紧凑表示：64位可以表示所有后端和功能组合
+- 快速操作：位运算（OR/AND/NOT）是CPU单周期指令
+- 优先级隐含：高位自动表示高优先级（通过`count leading zeros`找到最高位）
+
+**为什么分离Dispatcher和OperatorEntry？**
+- Dispatcher是全局单例，负责算子名称到OperatorHandle的映射
+- OperatorEntry管理单个算子的所有内核注册和分发表
+- 这种分离允许细粒度的锁（Dispatcher锁用于注册，查表无锁）
 
 ---
 
@@ -183,237 +215,675 @@ static const std::array<FunctionalityOffsetAndMask, num_functionality_keys>& off
 
 ---
 
-## 5. Dispatcher实现
+## 5. Dispatcher核心实现
 
-### 5.1 Dispatcher架构
+### 5.1 Dispatcher单例模式与线程安全
+
+Dispatcher采用**单例模式**全局唯一，但针对不同平台有不同优化：
 
 ```cpp
-// 来自aten/src/ATen/core/dispatch/Dispatcher.h
 class TORCH_API Dispatcher final {
+ private:
+  // 使用list而非vector避免重新分配时指针失效
   std::list<OperatorDef> operators_;
+  
+  // 读写锁保护的算子查找表
+  // 非Mobile: 使用LeftRight（一种无锁读写的数据结构）
+  // Mobile: 使用RWSafeLeftRightWrapper（更简单的读写锁）
+#if !defined(C10_MOBILE)
   LeftRight<ska::flat_hash_map<OperatorName, OperatorHandle>> operatorLookupTable_;
+#else
+  RWSafeLeftRightWrapper<ska::flat_hash_map<OperatorName, OperatorHandle>> operatorLookupTable_;
+#endif
+  
+  // Backend Fallback内核数组：每种DispatchKey对应一个Fallback内核
   std::array<impl::AnnotatedKernel, num_runtime_entries> backendFallbackKernels_;
+  
+  // 条件变量：用于多解释器场景（如torchdeploy）的注册同步
+  std::condition_variable cond_var_;
+  
+  // 保护并发访问的Guard（通过shared_ptr支持回调安全）
+  std::shared_ptr<Guard> guard_;
 };
 ```
 
-### 5.2 OperatorEntry
+**单例获取优化**：
 
 ```cpp
-// 来自aten/src/ATen/core/dispatch/OperatorEntry.h
-class TORCH_API OperatorEntry final {
-  std::array<KernelFunction, c10::num_runtime_entries> dispatchTable_;
-  ska::flat_hash_map<DispatchKey, std::list<AnnotatedKernel>> kernels_;
-  DispatchKeyExtractor dispatchKeyExtractor_;
-};
+C10_ALWAYS_INLINE static Dispatcher& singleton() {
+#if !defined C10_MOBILE
+  // 非Mobile：内联实现，避免函数调用开销
+  // 使用函数局部static确保单次初始化
+  static Dispatcher& s = realSingleton();
+  return s;
+#else
+  // Mobile：不内联，避免__cxa_guard_acquire带来的代码膨胀
+  return realSingleton();
+#endif
+}
 ```
 
-### 5.3 分发流程
+### 5.2 算子注册与查找
+
+**算子定义（Def）vs 实现（Impl）**：
 
 ```cpp
-// 来自aten/src/ATen/core/dispatch/Dispatcher.h
+// registerDef: 注册算子Schema（签名信息）
+// - 每个算子只能有一个Schema
+// - 增加def_count计数
+RegistrationHandleRAII registerDef(FunctionSchema schema, std::string debug, ...);
+
+// registerImpl: 注册具体内核实现
+// - 可以为不同DispatchKey注册多个实现
+// - 如：CPU实现、CUDA实现、Autograd实现
+RegistrationHandleRAII registerImpl(
+    OperatorName op_name,
+    std::optional<DispatchKey> dispatch_key,  // nullopt表示CatchAll
+    KernelFunction kernel,
+    ...
+);
+```
+
+**查找算子**：
+
+```cpp
+// 通过算子名称查找（用于内部调用）
+std::optional<OperatorHandle> findSchema(const OperatorName& operator_name);
+
+// 快速查找（用于C++ API），失败时抛出异常
+OperatorHandle findSchemaOrThrow(const char* name, const char* overload_name);
+```
+
+### 5.3 分发调用流程详解
+
+**Unboxed调用（模板化，性能最优）**：
+
+```cpp
 template <class Return, class... Args>
 C10_ALWAYS_INLINE_UNLESS_MOBILE Return Dispatcher::call(
     const TypedOperatorHandle<Return(Args...)>& op,
     Args... args) const {
-  // 步骤1：从参数计算分发键集
+  // 1. 从参数提取DispatchKeySet（编译时确定提取逻辑）
   auto dispatchKeySet = op.operatorDef_->op.dispatchKeyExtractor()
       .template getDispatchKeySetUnboxed<Args...>(args...);
   
-  // 步骤2：在分发表中查找内核
+  // 2. 查分发表获取内核（关键路径）
   const KernelFunction& kernel = op.operatorDef_->op.lookup(dispatchKeySet);
   
-  // 步骤3：调用内核
+  // 3. 调用内核（内联展开）
   return kernel.template call<Return, Args...>(
       op, dispatchKeySet, std::forward<Args>(args)...);
 }
 ```
 
----
-
-## 6. Dispatch Key提取
-
-### 6.1 多DispatchKeySet提取
+**Boxed调用（动态，用于Python绑定）**：
 
 ```cpp
-// 来自aten/src/ATen/core/dispatch/DispatchKeyExtractor.h
+void callBoxed(const OperatorHandle& op, Stack* stack) const {
+  // 从栈上的IValue提取DispatchKeySet
+  auto dispatchKeySet = op.operatorDef_->op.dispatchKeyExtractor()
+      .getDispatchKeySetBoxed(stack);
+  
+  const KernelFunction& kernel = op.operatorDef_->op.lookup(dispatchKeySet);
+  kernel.callBoxed(op, dispatchKeySet, stack);
+}
+```
+
+---
+
+## 6. OperatorEntry内核管理
+
+### 6.1 OperatorEntry数据结构
+
+OperatorEntry管理单个算子的所有注册内核和计算后的分发表：
+
+```cpp
+class TORCH_API OperatorEntry final {
+  OperatorName name_;                          // 算子名称（如"aten::add"）
+  std::optional<AnnotatedSchema> schema_;      // 可选的Schema定义
+  
+  // 计算后的分发表：数组索引 = DispatchKey运行时索引
+  std::array<KernelFunction, c10::num_runtime_entries> dispatchTable_;
+  
+  // 原始注册的内核（支持多版本和卸载）
+  // key: DispatchKey, value: 该key下注册的所有内核列表（按时间排序）
+  ska::flat_hash_map<DispatchKey, std::list<AnnotatedKernel>> kernels_;
+  
+  // 用于从参数提取DispatchKey的提取器
+  DispatchKeyExtractor dispatchKeyExtractor_;
+  
+  // Python缓存（加速Python层调用）
+  c10::PyHandleCache py_cache_;
+};
+```
+
+### 6.2 分发表计算逻辑
+
+**内核查找（运行时关键路径）**：
+
+```cpp
+const KernelFunction& lookup(DispatchKeySet ks) const {
+  // 步骤1：将DispatchKeySet转换为数组索引
+  const auto idx = ks.getDispatchTableIndexForDispatchKeySet();
+  
+  // 步骤2：索引越界检查（-1表示无法找到有效键）
+  if (C10_UNLIKELY(idx == -1)) {
+    reportError(ks.highestPriorityTypeId());
+  }
+  
+  // 步骤3：从预计算表中获取内核
+  const auto& kernel = dispatchTable_[idx];
+  
+  // 步骤4：验证内核有效性（开发模式检查）
+  if (C10_UNLIKELY(!kernel.isValidUnboxed())) {
+    if (!kernel.isValid()) {
+      reportError(ks.highestPriorityTypeId());
+    }
+  }
+  return kernel;
+}
+```
+
+**分发表重建（注册时）**：
+
+当新内核注册时，需要重新计算分发表：
+
+```cpp
+// 伪代码示意
+void updateDispatchTable_(DispatchKey dispatch_key) {
+  // 1. 获取该DispatchKey对应的内核列表（按注册时间排序）
+  auto& kernels = kernels_[dispatch_key];
+  
+  // 2. 取最新的内核（列表头部）
+  const auto& kernel = kernels.front();
+  
+  // 3. 计算该DispatchKey在表中的索引
+  auto idx = toRuntimeIndex(dispatch_key);
+  
+  // 4. 更新分发表
+  dispatchTable_[idx] = kernel.kernel;
+  
+  // 5. 对于别名键（如Autograd），展开到所有具体后端键
+  if (isAliasKey(dispatch_key)) {
+    for (auto expanded_key : expandAlias(dispatch_key)) {
+      updateDispatchTable_(expanded_key);
+    }
+  }
+}
+```
+
+### 6.3 内核生命周期管理
+
+**RAII注册句柄**：
+
+```cpp
+// registerImpl返回RAII句柄，析构时自动注销
+{
+  auto handle = dispatcher.registerImpl(
+      op_name, dispatch_key, kernel, ...);
+  // ... 使用内核 ...
+} // handle析构，自动调用deregisterImpl
+
+// 支持内核覆盖（如动态加载新库时）
+// 新内核加入列表头部，旧内核保留但不再使用
+// 卸载库时恢复旧内核
+```
+
+---
+
+## 7. Dispatch Key提取机制
+
+### 7.1 DispatchKeyExtractor设计
+
+提取器缓存了从算子参数提取DispatchKey的优化逻辑：
+
+```cpp
+struct TORCH_API DispatchKeyExtractor final {
+  // 位集合：标记哪些参数位置包含Tensor（需要提取key_set）
+  // 使用反向索引（从栈顶开始），便于Boxed调用时直接peek
+  c10::utils::bitset dispatch_arg_indices_reverse_;
+  
+  // 直通键掩码：标记哪些DispatchKey是直通（fallthrough）
+  DispatchKeySet nonFallthroughKeys_;
+  
+  // 是否需要每个后端单独的直通掩码（用于复杂算子）
+  bool requiresBitsetPerBackend_ = false;
+  std::array<DispatchKeySet, num_backends> nonFallthroughKeysPerBackend_;
+};
+```
+
+### 7.2 参数位集构建
+
+**Schema分析（注册时）**：
+
+```cpp
+static c10::utils::bitset makeBitsetForDispatchArgs(const FunctionSchema& schema) {
+  c10::utils::bitset dispatch_arg_indices_reverse;
+  
+  // 遍历所有参数
+  for (const auto index : c10::irange(schema.arguments().size())) {
+    const auto& arg = schema.arguments()[index];
+    
+    // 检查参数类型是否需要dispatch
+    if (isDispatchType(*arg.type())) {
+      // 记录反向索引（从栈顶）
+      dispatch_arg_indices_reverse.set(schema.arguments().size() - 1 - index);
+    }
+  }
+  return dispatch_arg_indices_reverse;
+}
+
+static bool isDispatchType(const Type& type) {
+  // Tensor类型
+  if (type.isSubtypeOf(*TensorType::get())) return true;
+  // Tensor列表类型
+  if (type.isSubtypeOf(*ListType::ofTensors())) return true;
+  // Optional<Tensor>类型
+  if (type.isSubtypeOf(*OptionalType::ofTensor())) return true;
+  return false;
+}
+```
+
+### 7.3 Unboxed提取（C++模板）
+
+编译时生成优化的提取代码：
+
+```cpp
+template <class... Args>
+DispatchKeySet getDispatchKeySetUnboxed(const Args&... args) const {
+  // 使用可变参数模板和CRTP模式迭代提取
+  auto ks = detail::multi_dispatch_key_set(args...);
+  
+  // 应用TLS和直通掩码
+  return impl::computeDispatchKeySet(
+      ks, 
+      requiresBitsetPerBackend_ 
+          ? nonFallthroughKeysPerBackend_[ks.getBackendIndex()]
+          : nonFallthroughKeys_
+  );
+}
+
+// MultiDispatchKeySet使用CRTP迭代
+template <typename... Args>
+DispatchKeySet multi_dispatch_key_set(const Args&... args) {
+  return MultiDispatchKeySet().apply(args...).ts;
+}
+
 struct MultiDispatchKeySet : at::IterArgs<MultiDispatchKeySet> {
   DispatchKeySet ts;
+  
+  // 重载：处理单个Tensor
   void operator()(const at::Tensor& x) {
     ts = ts | x.key_set();
   }
-  void operator()(at::ArrayRef<at::Tensor> xs) {
-    for (const auto& x : xs) {
-      ts = ts | x.key_set();
-    }
+  
+  // 重载：处理Optional<Tensor>
+  void operator()(const std::optional<at::Tensor>& x) {
+    if (x.has_value()) ts = ts | x->key_set();
   }
+  
+  // 重载：处理Tensor列表
+  void operator()(at::ArrayRef<at::Tensor> xs) {
+    for (const auto& x : xs) ts = ts | x.key_set();
+  }
+  
+  // 其他类型忽略
+  template <typename T>
+  void operator()(const T& /*unused*/) {}
 };
 ```
 
-### 6.2 计算最终DispatchKeySet
+### 7.4 Boxed提取（Python调用）
+
+从IValue栈提取（支持运行时动态检查）：
 
 ```cpp
-// 来自aten/src/ATen/core/dispatch/DispatchKeyExtractor.h
-inline DispatchKeySet computeDispatchKeySet(
-    DispatchKeySet ks,
-    DispatchKeySet key_mask) {
-  c10::impl::LocalDispatchKeySet local = c10::impl::tls_local_dispatch_key_set();
-  // 组合：张量键集 | TLS包含的键 - TLS排除的键
-  // 然后掩码掉直通键
-  return (((ks | local.included_) - local.excluded_) & key_mask);
+DispatchKeySet getDispatchKeySetBoxed(const torch::jit::Stack* stack) const {
+  DispatchKeySet ks;
+  
+  // 遍历标记的参数位置
+  dispatch_arg_indices_reverse_.for_each_set_bit([&](size_t reverse_arg_index) {
+    // 从栈peek（不pop，避免拷贝）
+    const auto& ivalue = torch::jit::peek(*stack, 0, reverse_arg_index + 1);
+    
+    if (C10_LIKELY(ivalue.isTensor())) {
+      // 直接访问TensorImpl避免引用计数
+      ks = ks | ivalue.unsafeToTensorImpl()->key_set();
+    } else if (C10_UNLIKELY(ivalue.isTensorList())) {
+      // 处理Tensor列表
+      for (const auto& nv : ivalue.toListRef()) {
+        ks = ks | nv.unsafeToTensorImpl()->key_set();
+      }
+    }
+  });
+  
+  return impl::computeDispatchKeySet(ks, nonFallthroughKeys_);
 }
 ```
 
 ---
 
-## 7. Boxing与Unboxing
+## 8. Backend Fallback机制
 
-### 7.1 KernelFunction
+### 8.1 Fallback内核注册
+
+Backend Fallback允许为整个后端注册默认处理函数：
 
 ```cpp
-// 来自aten/src/ATen/core/boxing/KernelFunction.h
+// 为特定DispatchKey注册Fallback内核
+RegistrationHandleRAII registerFallback(
+    DispatchKey dispatch_key,
+    KernelFunction kernel,
+    std::string debug
+);
+
+// 示例：为Python后端注册Fallback
+TORCH_LIBRARY_IMPL(_, Python, m) {
+  m.fallback(torch::CppFunction::makeFromBoxedFunction<&pythonFallback>());
+}
+```
+
+### 8.2 Fallback触发逻辑
+
+当算子没有特定内核时触发Fallback：
+
+```cpp
+// 在OperatorEntry::lookup中
+const KernelFunction& lookup(DispatchKeySet ks) const {
+  auto idx = ks.getDispatchTableIndexForDispatchKeySet();
+  const auto& kernel = dispatchTable_[idx];
+  
+  // 如果没有有效内核，尝试Fallback
+  if (C10_UNLIKELY(!kernel.isValid())) {
+    // 获取最高优先级的DispatchKey
+    auto highest_key = ks.highestPriorityTypeId();
+    
+    // 检查Dispatcher中是否有该key的Fallback
+    if (dispatcher.hasBackendFallbackForDispatchKey(highest_key)) {
+      return dispatcher.getBackendFallbackKernel(highest_key);
+    }
+    
+    // 报错：没有可用内核
+    reportError(highest_key);
+  }
+  return kernel;
+}
+```
+
+### 8.3 Fallback使用场景
+
+| 场景 | Fallback用途 |
+|------|-------------|
+| Python后端 | 所有算子都路由到Python处理（如TorchDispatchMode） |
+| Meta后端 | 返回Meta张量的形状信息而不执行计算 |
+| Functionalize | 将inplace操作转换为functional操作 |
+| Autograd | 自动生成反向传播逻辑 |
+
+---
+
+## 9. Boxing与Unboxing
+
+### 9.1 KernelFunction设计
+
+KernelFunction是内核的统一包装器，支持两种调用方式：
+
+```cpp
 class TORCH_API KernelFunction final {
 public:
-  // 以装箱方式调用
-  void callBoxed(const OperatorHandle& op, DispatchKeySet ks, Stack* stack) const;
-  
-  // 以未装箱方式调用
+  // Unboxed调用：直接C++函数调用，性能最优
   template <class Return, class... Args>
-  Return call(const OperatorHandle& op, DispatchKeySet ks, Args... args) const;
+  Return call(const OperatorHandle& op, DispatchKeySet ks, Args... args) const {
+    if (C10_LIKELY(unboxed_kernel_ != nullptr)) {
+      // 直接调用C++函数指针
+      return unboxed_kernel_(op, ks, std::forward<Args>(args)...);
+    }
+    // 退化到Boxed调用（很少发生）
+    return callUnboxedOnly<Return, Args...>(op, ks, std::forward<Args>(args)...);
+  }
+  
+  // Boxed调用：通过IValue栈，支持动态类型
+  void callBoxed(const OperatorHandle& op, DispatchKeySet ks, Stack* stack) const {
+    boxed_kernel_func_(op, ks, stack, boxed_kernel_);
+  }
+
+private:
+  // 两种内核存储
+  void* boxed_kernel_ = nullptr;                          // 装箱内核
+  using BoxedKernelFunc = void(*)(...);
+  BoxedKernelFunc boxed_kernel_func_ = nullptr;          // 装箱调用包装器
+  
+  // 可选的Unboxed内核（直接函数指针）
+  std::function<...> unboxed_kernel_ = nullptr;
 };
 ```
 
-### 7.2 Boxing工具
+### 9.2 Unboxed到Boxed的包装
+
+当只提供Boxed实现时，自动生成Unboxed包装器：
 
 ```cpp
-// 来自aten/src/ATen/core/boxing/impl/boxing.h
-// 将参数装箱到栈上
-template <class... Args>
-torch::jit::Stack boxArgs(Args... args) {
-  torch::jit::Stack stack;
+// 模板自动生成：将Unboxed参数装箱，调用Boxed内核，然后拆箱结果
+template <class Return, class... Args>
+Return make_boxed_from_unboxed(const OperatorHandle& op, DispatchKeySet ks, Args... args) {
+  // 1. 创建IValue栈
+  Stack stack;
   stack.reserve(sizeof...(Args));
+  
+  // 2. 装箱参数
   torch::jit::push(stack, std::forward<Args>(args)...);
-  return stack;
+  
+  // 3. 调用Boxed内核
+  op.callBoxed(stack);
+  
+  // 4. 拆箱结果
+  return std::move(stack[0]).to<Return>();
 }
 ```
+
+### 9.3 选择Boxed vs Unboxed
+
+| 场景 | 推荐方式 | 原因 |
+|------|---------|------|
+| C++原生内核 | Unboxed | 最高性能，零开销 |
+| Python内核 | Boxed | 需要通过IValue与Python交互 |
+| 动态类型 | Boxed | 运行时确定类型 |
+| 模板通用 | Unboxed | 编译时生成最优代码 |
 
 ---
 
-## 8. Python Dispatch集成
+## 10. Python Dispatch集成
 
-### 8.1 Python绑定
+### 10.1 PythonKernelHolder
 
-```cpp
-// 来自torch/csrc/utils/python_dispatch.cpp
-void initDispatchBindings(PyObject* module) {
-  py::class_<c10::OperatorHandle>(m, "_DispatchOperatorHandle")
-      .def("schema", &c10::OperatorHandle::schema)
-      .def("redispatch_boxed", ...);
-  
-  py::class_<torch::Library>(m, "_DispatchModule")
-      .def("def_", ...)      // 定义模式
-      .def("impl", ...)      // 注册实现
-      .def("fallback", ...); // 注册回退
-}
-```
-
-### 8.2 Python内核持有者
+Python内核通过持有PyObject*实现：
 
 ```cpp
-// 来自torch/csrc/utils/python_dispatch.cpp
 class PythonKernelHolder : public c10::OperatorKernel {
-  c10::SafePyObject func_;
+  c10::SafePyObject func_;       // Python函数对象（GIL安全）
   c10::DispatchKey dispatch_key_;
+  c10::SafePyObject module_name_;
   
 public:
   void operator()(const c10::OperatorHandle& op,
                   c10::DispatchKeySet keyset,
                   torch::jit::Stack* stack) {
-    // 处理TorchDispatchMode
+    // 检查是否有TorchDispatchMode激活
     if (c10::impl::TorchDispatchModeTLS::stack_len() > 0) {
-      // 分发到模式的PyInterpreter
+      // 路由到模式的__torch_dispatch__
+      auto* mode = c10::impl::TorchDispatchModeTLS::get_stack_at(
+        c10::impl::TorchDispatchModeTLS::stack_len() - 1);
+      return mode->dispatch(op, keyset, stack);
     }
     
-    // 处理具有__torch_dispatch__的张量子类
-    for (const auto& ivalue : arguments) {
-      if (ivalue.isTensor() && hasPythonKey(ivalue)) {
-        // 分发到张量的PyInterpreter
+    // 检查参数中是否有Python张量
+    auto arguments = torch::jit::pop(*stack, op.schema().arguments().size());
+    for (auto& ivalue : arguments) {
+      if (ivalue.isTensor() && isPythonTensor(ivalue.toTensor())) {
+        // 路由到张量的__torch_dispatch__
+        return dispatchToTensor(op, keyset, stack, ivalue.toTensor());
       }
     }
     
     // 默认：直接调用Python函数
     py::gil_scoped_acquire g;
-    auto result = func_(...);
-    pushPyOutToStack(op, stack, obj, "PythonKernelHolder");
+    auto result = py::call_function(func_.ptr(arguments...));
+    torch::jit::push(stack, result);
   }
 };
 ```
 
----
+### 10.2 TorchDispatchMode
 
-## 9. Composite与Alias Keys
+Python层的分发拦截机制：
 
-### 9.1 别名键机制
+```python
+# Python使用示例
+with torch.overrides.TorchDispatchMode(MyHandler):
+    # 此区域内的所有算子调用都会路由到MyHandler
+    x = torch.add(a, b)
 
-别名键（Alias Key）不对应分发表中的实际槽位，而是用于同时注册到多个后端键。
-
-| 别名键 | 扩展到 | 用例 |
-|--------|--------|------|
-| Autograd | 所有Autograd<Backend>键 | 为所有后端注册autograd内核 |
-| CompositeImplicitAutograd | Dense + 所有Autograd键 | 内核适用于所有后端和autograd |
-| CompositeExplicitAutograd | 仅Dense键 | 内核适用于所有后端但不包括autograd |
-
-### 9.2 CompositeExplicitAutograd vs CompositeImplicitAutograd
-
-```cpp
-// CompositeImplicitAutograd: 内核通过自动微分分解，适用于所有情况
-// 例如：aten::add.Tensor 可以用 aten::add.out 实现
-
-// CompositeExplicitAutograd: 内核只实现数值计算，不处理autograd
-// 例如：aten::convolution 需要显式的autograd内核
+class MyHandler:
+    def __torch_dispatch__(self, op, types, args, kwargs):
+        # 自定义处理逻辑
+        print(f"Called {op}")
+        return op(*args, **kwargs)
 ```
 
-### 9.3 注册示例
+C++层实现：
 
 ```cpp
-// 注册到CompositeImplicitAutograd会同时注册到CPU, CUDA等所有Dense后端
-TORCH_LIBRARY_IMPL(aten, CompositeImplicitAutograd, m) {
-  m.impl("my_op", my_op_kernel);  // 一次注册，多处可用
+// TLS存储当前激活的Mode栈
+thread_local std::vector<PyObject*> torch_dispatch_mode_stack;
+
+// 检查并分发
+bool TorchDispatchModeTLS::dispatch(const OperatorHandle& op, ...) {
+  if (!torch_dispatch_mode_stack.empty()) {
+    auto* mode = torch_dispatch_mode_stack.back();
+    // 调用mode的__torch_dispatch__
+    return callPythonDispatch(mode, op, ...);
+  }
+  return false;  // 没有激活的Mode
 }
 ```
 
 ---
 
-## 10. Functorch动态层
+## 11. Composite与Alias Keys
 
-### 10.1 动态层Dispatch Keys
+### 11.1 别名键机制
 
-Functorch（vmap, grad, vjp等）使用特殊的dispatch key来处理动态层：
-
-| Key | 用途 |
-|-----|------|
-| FuncTorchDynamicLayerFrontMode | 在前端拦截，设置层上下文 |
-| FuncTorchDynamicLayerBackMode | 在后端处理，恢复上下文 |
-| PythonTLSSnapshot | 保存/恢复Python TLS状态 |
-
-### 10.2 动态层工作原理
+别名键允许一次注册应用到多个后端：
 
 ```cpp
-// 当调用vmap(fn)(x)时：
-// 1. FuncTorchDynamicLayerFrontMode 被设置
-// 2. 函数在前端模式包装下执行
-// 3. 操作被拦截并根据batch大小扩展
-// 4. FuncTorchDynamicLayerBackMode 清理状态
-```
+// 别名键展开表
+static const std::array<DispatchKey, 3> autograd_backends = {
+    DispatchKey::AutogradCPU,
+    DispatchKey::AutogradCUDA,
+    DispatchKey::AutogradXLA,
+    // ... 更多后端
+};
 
-### 10.3 与Functionalization的关系
-
-```cpp
-// Functionalize key用于将in-place操作转换为functional操作
-// 这对vmap至关重要，因为vmap需要处理视图的批处理
-TORCH_LIBRARY_IMPL(_, Functionalize, m) {
-  // 转换 inplace 操作为 functional 操作
+// 注册时展开
+void registerKernelWithAlias(DispatchKey alias_key, KernelFunction kernel) {
+  for (auto expanded_key : expandAlias(alias_key)) {
+    registerImpl(expanded_key, kernel);
+  }
 }
 ```
+
+### 11.2 CompositeImplicitAutograd vs CompositeExplicitAutograd
+
+| 特性 | CompositeImplicitAutograd | CompositeExplicitAutograd |
+|------|---------------------------|---------------------------|
+| 扩展目标 | Dense + 所有Autograd后端 | 仅Dense后端（无Autograd） |
+| Autograd支持 | 通过分解自动支持 | 需要显式注册Autograd内核 |
+| 使用场景 | 纯函数式实现（无inplace） | 需要自定义梯度实现 |
+| 典型示例 | aten::add（用out=版本实现） | aten::convolution |
+
+**实现差异**：
+
+```cpp
+// CompositeImplicitAutograd内核
+Tensor add(const Tensor& self, const Tensor& other) {
+  Tensor result = at::empty(self.sizes(), self.options());
+  at::add_out(result, self, other);  // 调用out=版本
+  return result;
+}
+// Autograd自动处理，因为out=版本支持自动微分
+
+// CompositeExplicitAutograd内核
+Tensor convolution(const Tensor& input, const Tensor& weight, ...) {
+  // 数值计算
+  return native::convolution_nograd(input, weight, ...);
+}
+// 需要单独注册AutogradConvolution
+```
+
+---
+
+## 12. 线程安全与性能优化
+
+### 12.1 无锁读路径
+
+分发路径（call/lookup）是**完全无锁**的：
+
+```cpp
+// 线程局部缓存
+thread_local LocalDispatchKeySet tls_local_dispatch_key_set;
+
+// Dispatcher::call - 无锁
+// 1. 从TLS读取included/excluded keys
+// 2. 查分发表（预计算的数组索引）
+// 3. 调用内核
+
+// 关键保证：
+// - 分发表只在注册/注销时修改
+// - 读写使用内存屏障保证可见性
+// - 读路径不持有任何锁
+```
+
+### 12.2 LeftRight数据结构
+
+用于operatorLookupTable_的无锁读写：
+
+```cpp
+// LeftRight允许一个写者与多个读者并发
+// 写操作通过翻转"左右"副本实现
+class LeftRight<T> {
+  std::array<T, 2> data_;           // 两份数据
+  std::atomic<int> read_index_;     // 当前读索引（0或1）
+  std::atomic<int> write_count_;    // 写计数（用于同步）
+  
+public:
+  // 读：获取当前读索引，使用该副本
+  T read() {
+    return data_[read_index_.load()];
+  }
+  
+  // 写：修改非活动副本，原子翻转索引
+  void write(std::function<void(T&)> mutator) {
+    int other = 1 - read_index_.load();
+    mutator(data_[other]);
+    read_index_ = other;  // 原子翻转
+  }
+};
+```
+
+### 12.3 性能优化总结
+
+| 优化技术 | 效果 |
+|---------|------|
+| 64位位集表示 | 单次位运算确定分发目标 |
+| 预计算分发表 | O(1)数组索引，无哈希查找 |
+| 内联模板 | 编译时展开，零开销抽象 |
+| TLS缓存 | 避免全局锁，线程局部配置 |
+| 引用计数优化 | unsafeToTensorImpl避免RCU |
+| 分支预测 | C10_LIKELY/C10_UNLIKELY提示 |
+
+**典型分发开销**：
+- DispatchKeySet提取：~10-20个CPU周期
+- 分发表查找：~5个CPU周期
+- 总计：~20-30周期（纳秒级）
 
 ---
 

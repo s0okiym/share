@@ -60,8 +60,8 @@ flowchart TD
 |------|----------|------|
 | 入口点 | `torch/_dynamo/__init__.py` | 公共API与重置函数 |
 | Frame Hook | `torch/_dynamo/eval_frame.py` | PEP 523帧评估钩子 |
-| Frame转换 | `torch/_dynamo/convert_frame.py` | 帧转换主逻辑 |
-| 符号转换 | `torch/_dynamo/symbolic_convert.py` | 字节码符号执行 |
+| Frame转换 | `torch/_dynamo/convert_frame.py` | 帧转换主逻辑，错误处理 |
+| 符号转换 | `torch/_dynamo/symbolic_convert.py` | 字节码符号执行核心 |
 | 变量系统 | `torch/_dynamo/variables/` | VariableTracker实现 |
 | Source系统 | `torch/_dynamo/source.py` | 值来源追踪 |
 | Guard系统 | `torch/_dynamo/guards.py` | 守卫条件管理 |
@@ -70,6 +70,7 @@ flowchart TD
 | 代码生成 | `torch/_dynamo/codegen.py` | Python字节码生成 |
 | 后端注册 | `torch/_dynamo/backends/registry.py` | 编译器后端注册 |
 | 恢复执行 | `torch/_dynamo/resume_execution.py` | Graph Break后恢复 |
+| C++运行时 | `torch/csrc/dynamo/` | PEP 523钩子与Guard树 |
 
 ---
 
@@ -224,6 +225,25 @@ struct CacheEntry {
 };
 ```
 
+### 3.4 C++ FrameLocalsMapping优化
+
+**设计原理**：为了O(1)访问frame locals而不构建Python dict，Dynamo使用`FrameLocalsMapping`直接索引frame的`localsplus`数组。
+
+```cpp
+// torch/csrc/dynamo/framelocals_mapping.cpp
+
+class FrameLocalsMapping {
+    // 直接映射到frame->localsplus数组索引
+    // 避免Python dict的构建开销
+
+    PyObject* get_item(PyObject* name) {
+        // O(1)直接索引
+        int idx = name_to_idx[name];
+        return frame->localsplus[idx];
+    }
+};
+```
+
 ---
 
 ## 4. 字节码符号转换
@@ -234,7 +254,15 @@ struct CacheEntry {
 # torch/_dynamo/symbolic_convert.py
 
 class InstructionTranslatorBase:
-    """字节码指令符号转换器基类"""
+    """字节码指令符号转换器基类
+
+    核心职责：
+    1. 逐条解释Python字节码指令
+    2. 维护符号栈（symbolic stack）和符号本地变量
+    3. 通过dispatch_table分发到具体处理器
+    4. 处理控制流（循环、条件、异常）
+    5. 管理推测执行（speculative execution）
+    """
 
     def __init__(self, ...):
         self.stack: list[VariableTracker] = []  # 符号栈
@@ -286,6 +314,7 @@ flowchart TD
 ```python
 # LOAD_FAST处理器
 def handle_load_fast(self, inst):
+    """加载本地变量到栈"""
     name = inst.argval
     if name in self.symbolic_locals:
         self.push(self.symbolic_locals[name])
@@ -295,6 +324,7 @@ def handle_load_fast(self, inst):
 
 # CALL_FUNCTION处理器
 def handle_call_function(self, inst):
+    """函数调用处理"""
     args = self.popn(inst.argval)  # 弹出参数
     fn = self.pop()  # 弹出函数
 
@@ -304,12 +334,15 @@ def handle_call_function(self, inst):
 
 # BINARY_ADD处理器
 def handle_binary_add(self, inst):
+    """二元加法处理"""
     left, right = self.popn(2)
     result = left.call_method(self, "__add__", [right], {})
     self.push(result)
 ```
 
 ### 4.4 推测执行与重启
+
+**设计原理**：Dynamo支持推测执行——尝试执行某条分支，如果失败则重启分析并从另一条分支生成图断点。
 
 ```mermaid
 flowchart TD
@@ -330,11 +363,42 @@ flowchart TD
     F -->|"No"| B
 ```
 
+```python
+@dataclass
+class SpeculationEntry:
+    """推测执行条目
+
+    当Dynamo遇到需要推测的代码（如条件分支）时，
+    创建SpeculationEntry记录该位置。
+
+    如果推测失败（如遇到无法追踪的代码）：
+    1. 标记_failed = True
+    2. 抛出SpeculationRestartAnalysis
+    3. 从开头重启分析
+    4. 再次遇到此Entry时生成图断点
+    """
+    filename: str
+    lineno: int
+    instruction_pointer: int
+    _failed: bool = False
+    error_on_graph_break: bool | None = None
+    reason: GraphCompileReason | None = None
+
+    def fail_and_restart_analysis(self, error_on_graph_break: bool):
+        self._failed = True
+        raise exc.SpeculationRestartAnalysis(...)
+
+    def failed(self, tx: InstructionTranslatorBase) -> bool:
+        return self._failed
+```
+
 ---
 
 ## 5. VariableTracker系统
 
 ### 5.1 VariableTracker层次结构
+
+**设计原理**：Dynamo将所有Python值包装为VariableTracker对象，统一追踪值的来源、类型和可变性。
 
 ```mermaid
 classDiagram
@@ -423,27 +487,38 @@ flowchart TD
 
 ### 5.3 MutationType系统
 
+**设计原理**：控制哪些修改被允许，防止跨作用域的非法修改。
+
 ```python
 # VariableTracker的mutation_type字段控制可变性
 
 class MutationType:
-    scope: int  # 0=已存在, 1=顶级新创建, >=2=HOP内创建
+    """可变性类型
+
+    scope: 表示创建作用域深度
+    - 0: 已存在的外部值
+    - 1: 当前级别新创建
+    - >=2: Higher-Order Operator内部创建
+    """
+    scope: int
 
 class ValueMutationNew(MutationType):
     """新创建的值（可变）"""
-    pass
+    scope: int = 1
 
 class ValueMutationExisting(MutationType):
     """已存在的值（可变，需追踪修改）"""
+    scope: int = 0
     is_modified: bool
 
 class AttributeMutationNew(MutationType):
     """新创建对象的属性修改"""
+    scope: int = 1
     cls_source: Source
 
 class AttributeMutationExisting(MutationType):
     """已存在对象的属性修改"""
-    pass
+    scope: int = 0
 ```
 
 ### 5.4 作用域安全规则
@@ -469,7 +544,7 @@ flowchart TD
 
 ### 6.1 Source层次结构
 
-Source表示值的来源，用于生成guard和重建代码。
+**设计原理**：Source表示值的来源，用于生成guard和重建代码。
 
 ```mermaid
 classDiagram
@@ -534,6 +609,8 @@ flowchart TD
 
 ### 6.3 C++ Guard树
 
+**设计原理**：Guard在C++层组织为树结构，实现O(1)快速检查。
+
 ```cpp
 // torch/csrc/dynamo/guards.cpp
 // GuardManager树结构用于快速检查
@@ -544,31 +621,35 @@ class RootGuardManager : public GuardManager {
 };
 
 class GuardManager {
-    vector<LeafGuard*> leaf_guards;
-    vector<pair<GuardAccessor*, GuardManager*>> children;
+    vector<LeafGuard*> leaf_guards;           // 叶子守卫
+    vector<pair<GuardAccessor*, GuardManager*>> children;  // 子节点
 };
 
-// GuardAccessor类型
+// GuardAccessor类型 - 定义树边
 class FrameLocalsGuardAccessor : public GuardAccessor {
     // O(1)直接索引frame locals
-    PyObject* get(PyObject* obj);
+    int idx;  // frame->localsplus索引
 };
 
 class GetAttrGuardAccessor : public GuardAccessor {
     // 属性访问
+    PyObject* attr_name;
 };
 
 class DictGetItemGuardAccessor : public GuardAccessor {
     // 字典项访问
+    PyObject* key;
 };
 
-// LeafGuard类型
+// LeafGuard类型 - 实际检查
 class TypeMatchGuard : public LeafGuard {
-    // Py_TYPE比较
+    // Py_TYPE指针比较
+    PyTypeObject* expected_type;
 };
 
 class TensorMatchGuard : public LeafGuard {
-    // 张量属性检查：dtype, device, shape, stride, dispatch keys
+    // 张量属性检查
+    // dtype, device, shape, stride, dispatch keys
 };
 ```
 
@@ -609,7 +690,15 @@ flowchart TD
 # torch/_dynamo/output_graph.py
 
 class OutputGraph:
-    """管理FX图构建"""
+    """管理FX图构建
+
+    核心职责：
+    1. 维护FX图（通过SubgraphTracer）
+    2. 管理符号形状环境（ShapeEnv）
+    3. 收集Guards
+    4. 追踪SideEffects
+    5. 编译子图
+    """
 
     def __init__(self, ...):
         self.graph: torch.fx.Graph  # FX图
@@ -619,9 +708,18 @@ class OutputGraph:
         self.guards: set[Guard]  # 收集的guards
         self.shape_env: ShapeEnv  # 符号形状环境
         self.input_args: list[GraphArg]  # 图输入参数
+
+    def compile_subgraph(self):
+        """编译当前子图"""
+        # 1. 收集图输入
+        # 2. 构建GraphModule
+        # 3. 调用后端编译器
+        # 4. 生成输出字节码
 ```
 
 ### 7.2 SubgraphTracer与子图
+
+**设计原理**：支持Higher-Order Operators（如cond、map、scan）通过嵌套SubgraphTracer。
 
 ```mermaid
 flowchart TD
@@ -653,27 +751,26 @@ flowchart TD
 ```python
 # 创建FX节点的典型流程
 
-# 1. 获取输入的proxy
 def create_proxy(self, target, args, kwargs):
-    # args/kwargs中可能包含VariableTracker
+    """创建FX代理节点"""
+    # 1. 转换参数中的VariableTracker为proxy
     proxy_args = []
     for arg in args:
         if isinstance(arg, VariableTracker):
-            # 获取proxy表示
             proxy_args.append(arg.as_proxy())
         else:
             proxy_args.append(arg)
 
-    # 2. 创建FX节点
+    # 2. 在FX图中创建节点
     proxy = self.current_tracer.create_node(
-        "call_function",
-        target,
-        proxy_args,
-        {}
+        "call_function",  # 节点类型
+        target,           # 目标函数
+        proxy_args,       # 参数
+        {}                # kwargs
     )
     return proxy
 
-# 3. 包装为VariableTracker
+# 3. 包装结果
 result = TensorVariable.create(proxy, ...)
 ```
 
@@ -711,10 +808,17 @@ flowchart TD
 # torch/_dynamo/side_effects.py
 
 class SideEffects:
-    """追踪和重放副作用"""
+    """追踪和重放副作用
+
+    副作用类型：
+    1. 属性修改：obj.attr = value
+    2. 列表/字典修改：lst[0] = value
+    3. Cell变量更新
+    4. 张量钩子注册
+    """
 
     def __init__(self):
-        self.id_to_variable: dict[int, VariableTracker]  # id -> 变量映射
+        self.id_to_variable: dict[int, VariableTracker]
         self.store_attr_mutations: dict[VariableTracker, dict[str, VariableTracker]]
         self.keepalive: list[Any]  # 保持对象存活
         self.tensor_hooks: dict[int, tuple]  # 张量钩子
@@ -747,8 +851,8 @@ def codegen_side_effects(self, codegen):
     for vt, attrs in self.store_attr_mutations.items():
         for attr, value in attrs.items():
             # 生成: vt.attr = value
-            codegen(vt)
-            codegen(value)
+            codegen(vt)           # 加载对象
+            codegen(value)        # 加载值
             codegen.extend_output(
                 codegen.create_store_attrs(attr)
             )
@@ -849,13 +953,28 @@ def compiled_fn(x, y):
 # torch/_dynamo/exc.py
 
 def unimplemented(gb_type, context, explanation, hints):
-    """触发图断点"""
+    """触发图断点
+
+    参数：
+    - gb_type: 图断点类型（用于分类）
+    - context: 开发者上下文（可包含动态信息）
+    - explanation: 用户可读解释
+    - hints: 提示信息列表
+    """
     raise Unsupported(
         msg=explanation,
         gb_type=gb_type,
         context=context,
         hints=hints
     )
+
+# 使用示例
+unimplemented(
+    gb_type="custom_operator",
+    context=f"Unsupported operator: {op}",
+    explanation=f"Operator {op} is not supported by Dynamo",
+    hints=[graph_break_hints.SUPPORTABLE]
+)
 ```
 
 ### 10.2 图断点处理流程
@@ -874,7 +993,7 @@ flowchart TD
     H --> I["创建Continuation"]
     I --> J["跳转剩余代码"]
 
-    J --> K["两个代码对象:")
+    J --> K["两个代码对象:"]
     K --> L["1. 编译的FX图"]
     K --> M["2. Resume函数"]
 ```
@@ -888,7 +1007,7 @@ def create_resume_fn(code, ...):
     """生成从图断点恢复的函数"""
 
     # 生成代码结构:
-    def torch_dynamo_resume_in_fn(...):
+    def torch_dynamo_resume_in_fn(__resumed_locals):
         # 恢复局部变量
         x = __resumed_locals['x']
         y = __resumed_locals['y']
@@ -943,19 +1062,35 @@ _BACKENDS: dict[str, EntryPoint] = {}
 _COMPILER_FNS: dict[str, CompilerFn] = {}
 
 def register_backend(compiler_fn=None, name=None, tags=()):
-    """注册编译器后端"""
+    """注册编译器后端
+
+    使用示例：
+    @register_backend
+    def my_compiler(gm, example_inputs):
+        return gm.forward
+    """
     name = name or compiler_fn.__name__
     _BACKENDS[name] = None
     _COMPILER_FNS[name] = compiler_fn
     return compiler_fn
 
-# 使用示例
+# 内置后端
 @register_backend
-def my_compiler(gm, example_inputs):
-    # gm: FX GraphModule
-    # example_inputs: 示例输入张量
-    # 返回: 编译后的可调用函数
+def inductor(gm, example_inputs):
+    """PyTorch默认编译器，生成Triton/CPP内核"""
+    from torch._inductor import compile_fx
+    return compile_fx(gm, example_inputs)
+
+@register_backend
+def eager(gm, example_inputs):
+    """直接执行FX图，无编译"""
     return gm.forward
+
+@register_backend
+def aot_eager(gm, example_inputs):
+    """AOTAutograd + Eager"""
+    from torch._functorch import aot_autograd
+    return aot_autograd(...)
 ```
 
 ### 11.2 标准后端
@@ -981,7 +1116,7 @@ flowchart TD
     D --> E{"backend类型"}
 
     E -->|"inductor"| F["torch/_inductor/compile_fx.py"]
-    F --> G[" lowering + codegen"]
+    F --> G["lowering + codegen"]
     G --> H["生成Triton/CPP内核"]
 
     E -->|"eager"| I["直接返回"]
@@ -1067,28 +1202,110 @@ flowchart TD
     I --> J["Guard命中"]
 ```
 
-### 12.4 PGO (Profile-Guided Optimization)
+**代码实现**（`pgo.py`）：
 
 ```python
-# torch/_dynamo/pgo.py
-
-# Dynamo通过多次运行收集统计信息
-# 自动决定哪些维度应该是动态的
-
-# 初始：所有维度静态
-# 运行几次后发现某些维度经常变化
-# 自动提升为动态维度
-
 class FrameState:
-    """记录帧级别的动态形状状态"""
+    """记录帧级别的动态形状状态
+
+    通过多次运行收集统计信息
+    自动决定哪些维度应该是动态的
+    """
     automatic_dynamic: dict[str, FrameStateSizeEntry]
+
+class FrameStateSizeEntry:
+    """单个维度的状态"""
+    size: int           # 当前大小
+    dynamic: bool       # 是否已标记为动态
+    num_mismatches: int # 不匹配次数
+```
+
+### 12.4 缓存查找实现
+
+```cpp
+// torch/csrc/dynamo/eval_frame_cpp.cpp
+
+static PyObject* dynamo__custom_eval_frame(...) {
+    // 1. 获取ExtraState
+    ExtraState* extra_state = get_extra_state(frame->f_code);
+
+    // 2. 构建FrameLocalsMapping（O(1)访问）
+    FrameLocalsMapping* locals_mapping = FrameLocalsMapping::create(frame);
+
+    // 3. 遍历CacheEntry链表
+    CacheEntry* entry = extra_state->cache_entry_list;
+    while (entry != nullptr) {
+        // 4. 运行GuardManager检查（C++层）
+        bool guard_passed = entry->guard_manager->check(locals_mapping);
+
+        if (guard_passed) {
+            // 命中：执行编译代码
+            return execute_compiled_code(entry->compiled_code, frame);
+        }
+
+        // 未命中：继续下一个
+        entry = entry->next;
+    }
+
+    // 5. 全部未命中：调用Python回调编译
+    return call_python_callback(frame, callback);
+}
 ```
 
 ---
 
-## 13. 总结
+## 13. C++运行时层
 
-### 13.1 Dynamo核心设计模式
+### 13.1 文件结构
+
+| 文件 | 职责 |
+|------|------|
+| `eval_frame.c` | PEP 523钩子安装 |
+| `eval_frame_cpp.cpp` | 帧评估主逻辑 |
+| `extra_state.cpp` | ExtraState管理 |
+| `cache_entry.cpp` | CacheEntry管理 |
+| `guards.cpp` | Guard树实现（~7800行） |
+| `framelocals_mapping.cpp` | O(1) locals访问 |
+| `init.cpp` | Python模块初始化 |
+
+### 13.2 Guard树性能优化
+
+```cpp
+// torch/csrc/dynamo/guards.cpp
+
+class GuardManager {
+    // 关键优化：
+    // 1. 失败快速访问器重排序 - 最常失败的guard排在前面
+    // 2. 字典版本标签匹配 - 跳过未变化的子树
+    // 3. FrameLocalsMapping - 避免Python dict构建
+    // 4. check_nopybind - 避免pybind11开销
+
+    bool check(FrameLocalsMapping* mapping) {
+        // 检查叶子guards
+        for (auto* leaf : leaf_guards) {
+            if (!leaf->check(mapping)) {
+                return false;  // 快速失败
+            }
+        }
+
+        // 递归检查子节点
+        for (auto& [accessor, child] : children) {
+            PyObject* child_obj = accessor->access(mapping);
+            if (!child->check(child_obj)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+};
+```
+
+---
+
+## 14. 总结
+
+### 14.1 Dynamo核心设计模式
 
 1. **字节码级符号执行**: 不修改Python语法，直接处理字节码
 2. **VariableTracker抽象**: 统一包装Python值，支持懒加载
@@ -1096,7 +1313,7 @@ class FrameState:
 4. **副作用追踪**: 记录变异操作，生成重放代码
 5. **推测执行**: 尝试分支，失败则重启分析
 
-### 13.2 性能优化策略
+### 14.2 性能优化策略
 
 | 策略 | 实现 |
 |------|------|
@@ -1104,8 +1321,9 @@ class FrameState:
 | O(1) locals访问 | FrameLocalsMapping避免dict构建 |
 | 缓存LRU | CacheEntry链表管理 |
 | 自动动态形状 | 统计驱动维度提升 |
+| Fail-fast accessor | 最常失败的guard排在前面 |
 
-### 13.3 使用建议
+### 14.3 使用建议
 
 ```python
 # 1. 减少Graph Break
@@ -1129,4 +1347,18 @@ def fn3(x):
 # 4. 查看graph break原因
 import torch._logging
 torch._logging.set_logs(graph_breaks=True)
+
+# 5. 调试技巧
+# TORCH_LOGS="graph_code" - 查看捕获的FX图
+# TORCH_LOGS="guards,recompiles" - 查看守卫和重编译原因
+# TORCH_LOGS="+dynamo" - 完整调试日志
 ```
+
+### 14.4 常见陷阱
+
+1. **数据相关控制流**：if x.sum() > 0: 会导致图断点
+2. **非PyTorch操作**：print、time等会触发图断点
+3. **动态形状**：形状频繁变化导致重编译
+4. **Python对象修改**：不支持修改外部Python对象
+5. **异常处理**：try-except会触发图断点
+

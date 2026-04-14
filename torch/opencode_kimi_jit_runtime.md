@@ -41,7 +41,7 @@ flowchart TD
         B --> C[IR Graph]
         C --> D[图变换Pass]
         D --> E[优化后的Graph]
-        E --> F[解释器/编译执行]
+        E --> F["解释器/编译执行"]
     end
 
     subgraph "Pass优化"
@@ -257,14 +257,10 @@ graph(%x.1 : Tensor,
 
 ```mermaid
 flowchart TD
-    A[原始Graph] --> B[Pass1
-常量折叠]
-    B --> C[Pass2
-死代码消除]
-    C --> D[Pass3
-算子融合]
-    D --> E[Pass4
-形状推断]
+    A[原始Graph] --> B["Pass1<br/>常量折叠"]
+    B --> C["Pass2<br/>死代码消除"]
+    C --> D["Pass3<br/>算子融合"]
+    D --> E["Pass4<br/>形状推断"]
     E --> F[优化后的Graph]
 
     subgraph "Pass管理器"
