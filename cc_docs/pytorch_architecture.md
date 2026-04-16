@@ -466,7 +466,7 @@ flowchart TD
     subgraph "AutogradMeta"
         X -.->|"grad_fn_=nullptr<br/>grad_accumulator_=AccumulateGrad"| MX["x.grad"]
         W -.->|"grad_fn_=nullptr<br/>grad_accumulator_=AccumulateGrad"| MW["w.grad"]
-        Y -.->|"grad_fn_=AddBackward0<br/>output_nr_=0"| MY[]
+        Y -.->|"grad_fn_=AddBackward0<br/>output_nr_=0"| MY["NONE"]
         Z -.->|"grad_fn_=nullptr<br/>grad_accumulator_=AccumulateGrad"| MZ["z.grad"]
     end
 ```
