@@ -10,6 +10,7 @@
 | [02_modules.md](./02_modules.md) | 功能模块全景与职责划分 |
 | [03_mechanisms.md](./03_mechanisms.md) | 核心机制：流抽象、路由、代理链、DNS、TUN、QUIC |
 | [04_flows.md](./04_flows.md) | 关键流程与 Mermaid 流程图 |
+| [05_vless_vision_reality_client.md](./05_vless_vision_reality_client.md) | VLESS + VISION + REALITY 客户端支持说明与配置参考 |
 
 ## 快速定位
 
