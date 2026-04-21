@@ -348,7 +348,7 @@ flowchart TD
     F -->|否| G["记录错误<br/>ncclIbQpFatalError()"]
     F -->|是| H["从 wr_id 找到 request"]
     H --> I["request->events[devIndex]--"]
-    I --> J["还有 Completion?"}
+    I --> J{"还有 Completion?"}
     J -->|是| C
     J -->|否| E
     E --> K{"所有设备 events 归零?"}
