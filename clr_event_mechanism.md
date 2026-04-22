@@ -617,16 +617,142 @@ Event 可能因 GPU 异常（如页错误、非法指令）而进入错误状态
 
 ---
 
-## 9. 总结
+## 9. Event 机制与 AMD KMD（amdgpu）的关系
+
+在前面的章节中，我们重点描述了 CLR Event 机制在用户态的实现。然而，GPU 是一个受内核态驱动严格管理的硬件资源，CLR 的 Event 最终必须依赖内核驱动才能与 GPU 硬件交互。本节将系统梳理 CLR Event 与 Linux AMDGPU 内核驱动（KMD）之间的依赖关系。
+
+### 9.1 核心结论：CLR 不直接调用 KMD，但间接深度依赖
+
+通过对 CLR 源码（`rocclr/`、`hipamd/`）的全面审计，可以得出以下明确结论：
+
+- **CLR 自身不包含任何直接调用 amdgpu/KFD 的代码**。在 CLR 源码中搜索 `ioctl`、`libhsakmt`、`/dev/kfd`、`/dev/dri`、`mmap`（针对 GPU 寄存器）等关键词，结果均为零或仅有注释提及。
+- CLR 将所有的内核边界交互**完全委托给 ROCr Runtime**（`libhsa-runtime64.so`）。ROCr 是 CLR 与内核之间的唯一中介层。
+- 然而，CLR 的 Event 机制（AQL Queue、HSA Signal、Doorbell、内存分配）**在功能上深度依赖 AMDGPU/KFD 提供的内核服务**。没有 KFD，ROCr 无法创建队列和信号，CLR 的 Event 体系将无法运转。
+
+因此，CLR 与 KMD 的关系是：**逻辑解耦、物理依赖**。CLR 通过 ROCr API 抽象了底层硬件，但这些 API 的实体完全由 KFD 和 amdgpu 内核模块支撑。
+
+### 9.2 软件栈全景
+
+CLR Event 机制从用户态到内核态的完整调用栈如下：
+
+```mermaid
+graph TD
+    A["CLR<br/>libamdhip64.so / libamdocl64.so"] -->|"hsa_signal_wait<br/>hsa_queue_create<br/>hsa_amd_memory_pool_allocate"| B["ROCr Runtime<br/>libhsa-runtime64.so"]
+    B -->|"hsaKmtCreateQueue<br/>hsaKmtCreateEvent<br/>hsaKmtWaitOnMultipleEvents"| C["ROCt Thunk<br/>libhsakmt.so"]
+    C -->|"ioctl<br/>mmap"| D["KFD<br/>amdgpu.ko /dev/kfd"]
+    D -->|"回调 / 服务"| E["AMDGPU Core<br/>amdgpu.ko"]
+    E -->|"MMIO / Ring Buffer"| F["GPU Hardware<br/>CP / SDMA / IH"]
+```
+
+各层职责简述：
+
+| 层级 | 组件 | 在 Event 机制中的职责 |
+|------|------|----------------------|
+| **用户态前端** | CLR (`libamdhip64.so`) | 提供 `hip::Event`、`amd::Event`、`amd::Command` 等对象，构建 Barrier-AND Packet，管理 Command 生命周期。 |
+| **用户态运行时** | ROCr (`libhsa-runtime64.so`) | 实现 HSA 规范。管理 `hsa_queue_t`、`hsa_signal_t`、Interrupt Signal，提供 ROCr 扩展（如 `hsa_amd_signal_value_pointer`）。 |
+| **用户态 Thunk** | ROCt (`libhsakmt.so`) | 轻量级封装库。将 ROCr 的调用翻译为对 `/dev/kfd` 的 `ioctl`，并处理 `mmap` 映射。 |
+| **内核态计算驱动** | KFD (`amdgpu.ko` 的一部分) | 提供 `/dev/kfd` 字符设备。负责创建用户态队列、分配 Signal Page、处理 GPU 中断并唤醒等待线程。 |
+| **内核态显示/图形核心** | AMDGPU Core (`amdgpu.ko`) | 提供 TTM/GEM 内存管理、GPUVM 页表、Interrupt Handler (IH) 环读取、Doorbell 页分配、MQD/HQD 寄存器编程等基础服务。KFD 通过 `kgd2kfd` 回调调用这些服务。 |
+| **硬件** | GPU (CP, SDMA, IH) | 执行 AQL Packet，写入完成状态，产生中断。 |
+
+### 9.3 KFD 对 Event 机制的三大核心支撑
+
+虽然 CLR 不直接感知 KFD，但 KFD 在以下三个方面为 CLR Event 提供了不可或缺的基础设施。
+
+#### 9.3.1 AQL Queue 的创建与管理
+
+CLR 中的 `amd::HostQueue` / `hip::Stream` 最终需要一个硬件队列来执行命令。这个硬件队列就是 HSA AQL Queue，其创建流程如下：
+
+1. **内存分配**：ROCr 通过 ROCt 向 KFD 发起 `AMDKFD_IOC_ALLOC_MEMORY_OF_GPU` 和 `AMDKFD_IOC_MAP_MEMORY_TO_GPU`，由 amdgpu 的 TTM/GEM 子系统分配队列环缓冲区（Ring Buffer）、读指针（RPTR）、写指针（WPTR）、End-of-Packet（EOP）缓冲区以及上下文保存/恢复区。这些缓冲区被映射到进程的 GPUVM 地址空间。
+2. **队列注册**：ROCr 调用 `AMDKFD_IOC_CREATE_QUEUE`，KFD 内部执行：
+   - 查找当前进程对应的 `kfd_process` 和目标 GPU 的 `kfd_dev`。
+   - 调用 `pqm_create_queue()`，通过 `device_queue_manager` 操作集分配一个硬件队列槽位。
+   - 分配 **MQD**（Memory Queue Descriptor），其中保存队列的完整状态（GPU VA、Doorbell 偏移、WPTR/RPTR 地址等）。
+   - 通过 **KIQ**（Kernel Interface Queue）或 **MES** 固件将 MQD 加载到 **HQD**（Hardware Queue Descriptor）寄存器中，使 GPU 调度器能够识别并调度该队列。
+3. **Doorbell 分配**：KFD 从 GPU 的 Doorbell Aperture 中为该进程分配一段 Doorbell 页，并通过 `mmap` 将其映射到用户态地址空间。CLR 后续通过 `hsa_queue_t::doorbell_signal` 写入该地址来通知 GPU 有新工作到达，**无需系统调用**。
+
+#### 9.3.2 Signal Page 与中断唤醒
+
+CLR 中所有 `amd::Event::hw_event_` 的本质都是 `hsa_signal_t`，而 `hsa_signal_t` 的内核实现依赖 KFD 的 Signal Page 机制：
+
+1. **Signal Page 分配**：当 ROCr 首次创建 HSA Signal（通过 `hsaKmtCreateEvent` → `AMDKFD_IOC_CREATE_EVENT`）时，KFD 分配一个物理连续的 **Signal Page**（最多容纳 4096 个 64-bit Signal Slot）。该页被初始化为 `UNSIGNALED_EVENT_SLOT`。
+2. **用户态映射**：KFD 通过 `remap_pfn_range` 将该 Signal Page 映射到用户态虚拟地址空间。在独立显卡（dGPU）上，Signal Page 位于 GPU 可见的系统内存（GTT）中，以便 GPU CP 可以直接写入。
+3. **GPU 完成通知（零内核介入路径）**：当 GPU 完成一个 AQL Packet（如内核分发或 Barrier-AND）后，CP 直接将完成值写入 Signal Page 中对应的 Slot。**此步骤完全不需要内核参与**，是纯粹的内存写操作。这也是 CLR 的硬件快速等待路径（`hsa_signal_wait_scacquire` 轮询用户态内存）能够零 syscall 工作的根本原因。
+4. **CPU 阻塞与中断唤醒**：当主机线程需要阻塞等待（如 `hipEventSynchronize` 走软件路径）时，ROCr 通过 `AMDKFD_IOC_WAIT_EVENTS` 进入内核。KFD 为每个待等待的 Signal 创建一个 `kfd_event_waiter`，将其挂到内核 `waitqueue_head_t` 上并睡眠。当 GPU 完成工作并触发中断时，KFD 中断处理程序解析 IH Ring 中的事件，找到对应的 `kfd_event`，设置 `signaled = true`，并调用 `wake_up_all()` 唤醒阻塞线程。
+
+#### 9.3.3 Doorbell 映射
+
+Doorbell 是用户态通知 GPU "有新命令请处理" 的关键机制：
+- KFD 通过 amdgpu 的 `AMDGPU_GEM_DOMAIN_DOORBELL` 域分配 Doorbell 页。
+- 该页被 `mmap` 到用户态后，ROCr 将其地址缓存到 `hsa_queue_t::doorbell_signal`。
+- CLR 在 `FlushSubmissionBatch()` 时执行一次对该用户态地址的写操作（`__atomic_store_n`），即完成硬件通知。该写操作通过 PCI BAR 直接到达 GPU 的 Doorbell 接收逻辑，无需陷入内核。
+
+### 9.4 GPU 完成到 CLR 的完整中断路径
+
+下图展示了从 GPU 硬件完成一个命令，到最终 CLR 中 `amd::Event::setStatus(CL_COMPLETE)` 被调用的完整内核-用户态协作链路：
+
+```mermaid
+graph TD
+    A["GPU CP / SDMA 完成 AQL Packet"] -->|"写完成值到 Signal Page Slot<br/>零内核介入"| B["Signal Page<br/>用户态可见内存"]
+    A -->|"写入 IH Ring Entry<br/>携带 PASID + context_id"| C["GPU IH Ring Buffer<br/>中断处理环"]
+    C -->|"触发 MSI/IRQ"| D["CPU 中断入口"]
+    D --> E["amdgpu_irq_handler<br/>amdgpu_ih_process"]
+    E -->|"按 client_id/source_id 分发"| F["kgd2kfd_interrupt"]
+    F --> G["KFD event_interrupt_wq_v9<br/>解析 SOC15_INTSRC_CP_END_OF_PIPE<br/>或 SOC15_INTSRC_SDMA_TRAP"]
+    G --> H["kfd_signal_event_interrupt<br/>按 PASID 查找 kfd_process"]
+    H --> I["set_event_from_interrupt<br/>acknowledge_signal + wake_up_all"]
+    I --> J["阻塞在 WAIT_EVENTS ioctl<br/>的主机线程被唤醒"]
+    J --> K["ROCr: InterruptSignal::WaitRelaxed 返回"]
+    K --> L["CLR: amd::Event::setStatus<br/>CL_COMPLETE"]
+    B -->|"用户态轮询发现 Signal 归零<br/>零 syscall 路径"| M["ROCr: hsa_signal_wait_scacquire 返回"]
+    M --> L
+```
+
+**两条完成通知路径的对比**：
+
+| 路径 | 触发条件 | 是否涉及内核 | 延迟特征 | 适用场景 |
+|------|---------|-------------|---------|---------|
+| **用户态轮询** | Signal Page Slot 被 GPU 直接写为完成值 | 否（纯用户态内存读） | 最低延迟（微秒级），但消耗 CPU | `HSA_WAIT_STATE_ACTIVE`、短超时、高频查询 |
+| **中断唤醒** | GPU 写 IH Ring → CPU IRQ → KFD 唤醒 | 是（完整中断处理链） | 较高延迟（数十至数百微秒），零 CPU 开销 | `HSA_WAIT_STATE_BLOCKED`、长时间等待、主机线程睡眠 |
+
+CLR 的 `hipEventSynchronize` 和 `amd::Event::awaitCompletion` 会根据策略（active wait / yield / blocked）在两条路径之间自适应选择。
+
+### 9.5 KFD Event 与 dma-fence 的区别
+
+在 AMDGPU 内核生态中，存在两种看似相似但用途截然不同的同步原语，理解它们的区别对于定位问题至关重要：
+
+| 维度 | **KFD Event / HSA Signal** | **dma-fence** |
+|------|---------------------------|---------------|
+| **内核结构** | `kfd_event`、`signal page`、`waitqueue_head_t` | `dma_fence`、`drm_sched_fence`、`dma_resv` |
+| **用户态接口** | `/dev/kfd` ioctl（`CREATE_EVENT`、`WAIT_EVENTS`） | 无直接用户态接口，主要在内核内部使用 |
+| **使用场景** | 计算队列（AQL Queue）完成通知、用户态 Event 同步 | DRM GPU Scheduler 作业调度、BO 驻留管理、TTM Eviction、跨驱动 Buffer 共享 |
+| **GPU 通知方式** | GPU CP 直接写 Signal Page（内存写） | 硬件 Ring 完成中断 → `amdgpu_fence_process()` → `dma_fence_signal()` |
+| **CLR 是否使用** | **是**。所有 `hipEvent`、`streamWait` 都基于此。 | **否**。CLR 的 AQL Queue 绕过 DRM Scheduler，不直接使用 dma-fence。但 KFD 在 TTM Eviction 时会使用 dma-fence 作为侧翼机制（`amdgpu_amdkfd_fence`）。 |
+| **路径归属** | KFD 用户态计算路径 | AMDGPU DRM 图形/调度路径 |
+
+**简言之**：CLR 的 Event 机制走的是 **KFD 用户态计算路径**，其核心是 Signal Page + KFD Interrupt；而 `dma-fence` 是 AMDGPU DRM 子系统内部用于缓冲区对象（BO）生命周期管理和图形作业调度的机制。两者在内核中并行存在，服务于不同的子系统，但在 TTM 内存回收时会产生交互（例如 KFD 需要等待 dma-fence 才能安全迁移 BO）。
+
+### 9.6 总结
+
+CLR 的 Event 机制虽然在源码层面与 AMDGPU KMD 完全解耦，但在运行时却构建于 KFD 提供的三大基石之上：**AQL Queue 管理**、**Signal Page 中断唤醒**和 **Doorbell 用户态映射**。理解这一边界，有助于开发者定位以下类型的问题：
+
+- **Event 不触发 /  hang**：可能需要检查 KFD 中断是否被正确路由（`amdgpu.irq` 参数、IH ring 溢出）。
+- **Event 延迟异常高**：可能是主机等待策略退化为阻塞路径，或 KFD 中断处理线程（`event_interrupt_wq`）调度延迟。
+- **多进程 Event 同步失败**：IPC Event 依赖 KFD 的 PASID 隔离和 Signal Page 的进程级可见性，需要确认 KFD 是否启用了必要的进程共享支持。
+
+---
+
+## 10. 总结
 
 AMD CLR 的 Event 机制是一个高度统一、层次分明的同步体系：
 
 - **软件层**：`amd::Event` / `amd::Command` 提供了与前端无关的状态追踪、回调管理和主机通知能力。
 - **调度层**：`amd::HostQueue` 与 `hip::Stream` 通过 Direct Dispatch 或 Threaded Queue 将命令高效地喂给 GPU。
-- **硬件层**：`roc::VirtualGPU` 与 `HwQueueTracker` 利用 HSA Signal 和 Barrier-AND Packet 实现了低开销的硬件同步。
+- **硬件抽象层**：`roc::VirtualGPU` 与 `HwQueueTracker` 利用 HSA Signal 和 Barrier-AND Packet 实现了低开销的硬件同步。
+- **内核支撑层**：KFD / AMDGPU 提供了 AQL Queue、Signal Page 和 Doorbell 等基础设施，使上述用户态机制得以落实在真实 GPU 硬件之上。
 
-Event、同步与 Barrier 三者相辅相成：Event 提供“是否完成”的查询能力，同步是用户显式要求的“顺序保证”动作，而 Barrier 是运行时落实在硬件上的“顺序 enforcement”机制。理解这一链条，有助于开发者写出既正确又高性能的 GPU 程序。
+Event、同步与 Barrier 三者相辅相成：Event 提供“是否完成”的查询能力，同步是用户显式要求的“顺序保证”动作，而 Barrier 是运行时落实在硬件上的“顺序 enforcement”机制。理解从 CLR 到 ROCr、从 ROCr 到 KFD、再从 KFD 到 GPU 硬件的完整链条，有助于开发者写出既正确又高性能的 GPU 程序。
 
 ---
 
-*本文档基于 AMD CLR 代码库中 `rocclr/platform/`、`hipamd/src/` 及 `opencl/amdocl/` 等模块的源码分析整理而成。*
+*本文档基于 AMD CLR 代码库中 `rocclr/platform/`、`hipamd/src/` 及 `opencl/amdocl/` 等模块的源码分析，并结合 AMDGPU Kernel Driver 文档与 ROCr/ROCt 架构资料整理而成。*
