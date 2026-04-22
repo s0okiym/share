@@ -119,6 +119,97 @@ hip::Event
 
 **在 CLR 的当前架构中，Marker 与 Barrier 本质上是同一操作**。这是因为 CLR 的队列默认是 in-order 的，加上 Barrier-AND Packet 已经足以表达“等待某些事件完成后再继续”的语义。OpenCL 的 `clEnqueueMarkerWithWaitList` 和 `clEnqueueBarrierWithWaitList` 在底层都映射为 `amd::Marker`。
 
+### 3.6 Event 类型总览
+
+在 CLR 中，**Event 是一个广义概念**。从最底层的硬件 Signal，到中间的 `amd::Event` 状态对象，再到承载具体 GPU 操作的 `amd::Command`，以及 HIP/OpenCL 前端的各类封装，整个体系涵盖了数十种不同的类型。下表按照软件栈层次进行了全面梳理。
+
+> **说明**：`amd::Command` 继承自 `amd::Event`，因此下表中所有 Command 子类本质上也是一种 Event（具备状态、可等待、可剖析）。表格中的“类别”列用于区分其语义角色：`Event 基类` 与 `显式事件` 属于纯同步对象；`Command 基类` 与 `Command 子类` 属于带执行语义的事件；`HIP 封装` 是前端面向用户的对象；`Backend 抽象` 则对应硬件信号与设备调度结构。
+
+#### Platform 层 — 基础 Event 与显式事件（`rocclr/platform/`）
+
+| 类型名称 | 父类 | 类别 | 说明 |
+|---------|------|------|------|
+| `amd::Event` | `RuntimeObject` | Event 基类 | 所有同步对象的根基。封装状态机、时间戳、回调链表、硬件信号句柄 `hw_event_`。 |
+| `amd::Command` | `amd::Event` | Command 基类 | 所有可提交 GPU 操作的抽象基类。增加队列归属、等待列表 `eventWaitList_`、批次链接与 `submit()` 接口。 |
+| `amd::UserEvent` | `amd::Command` | 显式事件 | OpenCL 用户事件。由主机端通过 `clCreateUserEvent` 创建，并显式调用 `clSetUserEventStatus` 触发状态变更。 |
+| `amd::ClGlEvent` | `amd::Command` | 显式事件 | OpenCL-OpenGL 互操作围栏同步对象。用于在 OpenCL 与 OpenGL 共享对象之间建立执行顺序。 |
+| `amd::Marker` | `amd::Command` | 同步命令 | 零操作同步命令。仅用于制造执行边界，在 ROCr 后端被翻译为 AQL Barrier-AND Packet。 |
+
+#### Platform 层 — 具体 Command 子类（`rocclr/platform/`）
+
+| 类型名称 | 父类 | 类别 | 说明 |
+|---------|------|------|------|
+| `amd::ReadMemoryCommand` | `OneMemoryArgCommand` | 内存命令 | 从设备内存（Buffer/Image）读取数据到主机内存。 |
+| `amd::WriteMemoryCommand` | `OneMemoryArgCommand` | 内存命令 | 从主机内存写入数据到设备内存（Buffer/Image）。 |
+| `amd::FillMemoryCommand` | `OneMemoryArgCommand` | 内存命令 | 以指定模式填充设备内存区域。 |
+| `amd::CopyMemoryCommand` | `TwoMemoryArgsCommand` | 内存命令 | 设备内部内存拷贝（Buffer ↔ Buffer，Image ↔ Image 等）。 |
+| `amd::CopyMemoryP2PCommand` | `CopyMemoryCommand` | 内存命令 | 点对点（Peer-to-Peer）跨设备内存拷贝。 |
+| `amd::MapMemoryCommand` | `OneMemoryArgCommand` | 内存命令 | 映射设备内存对象到主机可访问地址空间。 |
+| `amd::UnmapMemoryCommand` | `OneMemoryArgCommand` | 内存命令 | 解除先前映射的设备内存对象。 |
+| `amd::MigrateMemObjectsCommand` | `amd::Command` | 内存命令 | 将一组内存对象迁移到目标设备，以优化访问局部性。 |
+| `amd::StreamOperationCommand` | `OneMemoryArgCommand` | 流内存命令 | 流式等待值（wait-value）或写值（write-value）操作，用于细粒度设备内存信号。 |
+| `amd::BatchMemoryOperationCommand` | `amd::Command` | 流内存命令 | 批量执行多个流内存操作（如多个 wait/write），合并为单次提交以减少开销。 |
+| `amd::BatchCopyMemoryCommand` | `amd::Command` | 流内存命令 | 批量执行多个 Buffer-to-Buffer 拷贝，合并为单次提交。 |
+| `amd::SignalCommand` | `OneMemoryArgCommand` | 流内存命令 | 在设备内存指定偏移处写入一个 32-bit 标记值，用于轻量级信号通知。 |
+| `amd::NDRangeKernelCommand` | `amd::Command` | 计算命令 | NDRange 内核启动命令。支持普通内核、合作组（cooperative groups）及多设备联合启动。 |
+| `amd::NativeFnCommand` | `amd::Command` | 计算命令 | 在主机队列线程上执行一个原生主机函数回调（Host Callback）。 |
+| `amd::ExternalSemaphoreCmd` | `amd::Command` | 计算命令 | 对外部信号量（如 Vulkan/DX12 semaphore）执行等待或信号操作。 |
+| `amd::AccumulateCommand` | `amd::Command` | 分析命令 | 累积前序命令的剖析时间戳与内核名称，用于汇总统计。 |
+| `amd::PerfCounterCommand` | `amd::Command` | 分析命令 | 开始或结束性能计数器采集。 |
+| `amd::ThreadTraceCommand` | `amd::Command` | 分析命令 | 控制线程追踪的 begin/end/pause/resume。 |
+| `amd::ThreadTraceMemObjectsCommand` | `amd::Command` | 分析命令 | 为线程追踪机制绑定内存对象。 |
+| `amd::AcquireExtObjectsCommand` | `ExtObjectsCommand` | 外部对象命令 | 从外部 API（如 OpenGL）获取共享对象的访问权。 |
+| `amd::ReleaseExtObjectsCommand` | `ExtObjectsCommand` | 外部对象命令 | 将共享对象释放回外部 API。 |
+| `amd::SvmFreeMemoryCommand` | `amd::Command` | SVM 命令 | 释放一组 SVM 指针。支持通过用户回调异步执行释放。 |
+| `amd::SvmCopyMemoryCommand` | `amd::Command` | SVM 命令 | 在两个 SVM 指针之间执行拷贝。 |
+| `amd::SvmFillMemoryCommand` | `amd::Command` | SVM 命令 | 对 SVM 区域执行模式填充。 |
+| `amd::SvmMapMemoryCommand` | `amd::Command` | SVM 命令 | 映射 SVM 共享缓冲区以供主机访问。 |
+| `amd::SvmUnmapMemoryCommand` | `amd::Command` | SVM 命令 | 解除 SVM 共享缓冲区的映射。 |
+| `amd::SvmPrefetchAsyncCommand` | `amd::Command` | SVM 命令 | 异步预取 SVM 内存到指定设备或主机。 |
+| `amd::SvmPrefetchBatchAsyncCommand` | `amd::Command` | SVM 命令 | 批量异步预取多个 SVM 区间到各自的目标设备。 |
+| `amd::VirtualMapCommand` | `amd::Command` | 虚拟内存命令 | 为指针执行虚拟内存映射或解除映射（用于 VA 预留机制）。 |
+| `amd::MakeBuffersResidentCommand` | `amd::Command` | 虚拟内存命令 | 使一组缓冲区常驻（resident），暴露总线地址以支持 P2P 访问。 |
+
+#### HIP 层 — Event 封装与扩展（`hipamd/src/`）
+
+| 类型名称 | 父类/关联基类 | 类别 | 说明 |
+|---------|--------------|------|------|
+| `hip::Event` | — | HIP 封装 | 标准 HIP Event 包装器。内部持有 `amd::Event*`（通常指向一个 Marker 的 event），提供 `record`、`query`、`synchronize` 和 `elapsedTime`。 |
+| `hip::EventDD` | `hip::Event` | HIP 封装 | Direct Dispatch 优化版 Event。绕过部分软件路径，直接通过硬件事件查询与时间戳采集，降低主机开销。 |
+| `hip::IPCEvent` | `hip::Event` | HIP 封装 | 跨进程事件。基于 POSIX 共享内存（`ihipIpcEventShmem_t`）维护一个 32 槽 GPU Signal 环形缓冲区，实现多进程间的执行同步。 |
+| `hip::EventMarker` | `amd::Marker` | HIP 封装 | HIP 专用的 Marker 命令。在 `amd::Marker` 基础上增加缓存作用域（cache scope）控制和 profiling 标志，用于 `hipEventRecord`。 |
+| `hip::StreamCallback` | — | 回调封装 | 流回调抽象基类。定义了回调在队列线程上的执行接口。 |
+| `hip::StreamAddCallback` | `StreamCallback` | 回调封装 | 包装传统的 `hipStreamCallback_t` 回调。 |
+| `hip::LaunchHostFuncCallback` | `StreamCallback` | 回调封装 | 包装 `hipHostFn_t` 回调，用于 `hipLaunchHostFunc`。 |
+| `hip::GraphEventWaitNode` | `hip::GraphNode` | 图节点 | HIP Graph 中的事件等待节点。图执行时在该点插入对指定 `hipEvent_t` 的等待。 |
+| `hip::GraphEventRecordNode` | `hip::GraphNode` | 图节点 | HIP Graph 中的事件记录节点。图执行时在指定流中记录 `hipEvent_t`。 |
+| `hip::FreeAsyncCommand` | `amd::Command` | 图命令 | 延迟释放命令。用于 `hipFreeAsync`，避免与图内存分配发生竞争。 |
+| `hip::VirtualMemAllocNode` | `amd::VirtualMapCommand` | 图命令 | 图内部命令：先分配物理内存，再将其映射到预留的虚拟地址（VA）中。 |
+| `hip::VirtualMemFreeNode` | `amd::VirtualMapCommand` | 图命令 | 图内部命令：先解除 VA 映射，再释放底层物理内存分配。 |
+
+#### OpenCL 层
+
+OpenCL 前端**没有定义独立的 C++ Event 子类**，而是直接复用 Platform 层的 `amd::Event`、`amd::Command`、`amd::UserEvent` 和 `amd::ClGlEvent`。`cl_event` 在实现层面就是一个指向 `amd::Event` 实例的不透明句柄。
+
+#### Device / Backend 层 — 硬件 Signal 与调度抽象
+
+| 类型名称 | 所属/父类 | 类别 | 说明 |
+|---------|----------|------|------|
+| `amd::device::Signal` | `HeapObject` | Signal 基类 | 后端无关的信号抽象。定义等待条件（equal/less-than/greater-than 等）与状态查询接口。 |
+| `amd::roc::Signal` | `device::Signal` | ROCr Signal | Linux ROCr 后端的 HSA Signal 包装器。直接封装 `hsa_signal_t`，提供原子等待与加载操作。 |
+| `amd::pal::Signal` | `device::Signal` | PAL Signal | Windows PAL 后端的信号实现。包装 `amd_signal_t` 与 `Util::Event`。 |
+| `amd::roc::ProfilingSignal` | `ReferenceCountedObject` | ROCr Signal | 带引用计数的 HSA Signal，缓存时间戳数据（queued/submitted/start/end），用于 profiling 分发。 |
+| `amd::roc::Timestamp` | `ReferenceCountedObject` | ROCr 计时 | 追踪单个命令的 GPU 开始/结束时间。可聚合多个 `ProfilingSignal` 的时间戳。 |
+| `amd::roc::VirtualGPU::HwQueueTracker` | `VirtualGPU` 内嵌 | 队列追踪 | 管理 HSA Signal 池（`signal_list_`）与外部信号列表（`external_signals_`）。负责为每个提交分配 `ActiveSignal` 并构建 Barrier Packet。 |
+| `amd::roc::AmdEvent` | — | 设备调度 | ROCr 设备端调度结构。用于设备入队（device enqueue）场景，描述子队列中的事件状态与计数器。 |
+| `amd::roc::AmdAqlWrap` | — | 设备调度 | ROCr AQL 包包装器。为设备端调度附加状态机信息。 |
+| `amd::roc::SchedulerParam` | — | 设备调度 | ROCr 调度核函数的参数块，用于控制子队列分发。 |
+| `amd::pal::AmdEvent` | — | 设备调度 | PAL 设备端事件结构。功能与 ROCr 的 `AmdEvent` 对应，用于 PAL 后端的设备调度与 profiling。 |
+| `amd::pal::AmdAqlWrap` | — | 设备调度 | PAL AQL 包包装器。功能与 ROCr 的 `AmdAqlWrap` 对应。 |
+| `amd::pal::SchedulerParam` | — | 设备调度 | PAL 调度核函数的参数块。 |
+| `pal::GpuEvent` | — | PAL 描述符 | PAL GPU 事件描述符。包含事件 ID、修改位与引擎 ID，用于 PAL 命令缓冲区提交。 |
+| `amd::Device::HwEventPatch` | `Device` 内嵌 | 硬件补丁 | 描述在 AQL 包或 Barrier 包中需要补丁写入硬件事件句柄的位置。用于 Direct Dispatch 下的快速路径。 |
+
 ---
 
 ## 4. 实现机制详解
