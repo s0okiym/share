@@ -5,6 +5,8 @@
 1. [概述](#1-概述)
 2. [V1: NVSHMEM IBGDA 通信后端](#2-v1-nvshmem-ibgda-通信后端)
 3. [V2: NCCL GIN 通信后端 (epv2-release)](#3-v2-nccl-gin-通信后端-epv2-release)
+   - [3.6 GDAKI 后端详解](#36-nccl-gin-内部实现-gdaki-后端详解)
+   - [3.7 IBGDA vs GDAKI 逐函数对比](#37-ibgda-vs-gdaki-逐函数对比)
 4. [V1 vs V2 对比分析](#4-v1-vs-v2-对比分析)
 5. [附录: 关键术语表](#5-附录-关键术语表)
 
@@ -447,23 +449,48 @@ flowchart LR
 | **LSA (Local Shared Address)** | NVLink 域内的对称地址空间，支持直接指针访问 |
 | **ncclDevComm** | 设备端通信器，包含 GIN 上下文和 QP 资源 |
 
-#### GIN vs IBGDA 的本质区别
+#### GIN 内部架构: 双后端设计
+
+NCCL GIN 内部实现了两种通信后端，通过 `ncclGinCallImpl` 在运行时自动选择:
 
 ```mermaid
 flowchart TB
-    subgraph "V1: IBGDA (直接操作硬件)"
-        I1["GPU Thread"] --> I2["手动构造 Mellanox WQE"]
-        I2 --> I3["手动管理 lkey/rkey"]
-        I3 --> I4["手动写入 BF Doorbell"]
-        I4 --> I5["手动轮询 CQE"]
+    G1["GPU Thread: ncclGin.put()"] --> G2{"ncclGinCallImpl 分发"}
+    G2 -->|"GDAKI 后端<br/>(NCCL_GIN_GDAKI_ENABLE)"| G3["doca_gpu_dev_verbs_put()"]
+    G2 -->|"Proxy 后端<br/>(NCCL_GIN_PROXY_ENABLE)"| G4["写入 producer index"]
+    G3 --> G5["doca_gpu_dev_verbs_wqe_prepare_write()<br/>构造 Mellanox WQE"]
+    G5 --> G6["doca_gpu_dev_verbs_ring_db()<br/>写入 BlueFlame Doorbell"]
+    G6 --> G7["NIC"]
+    G4 --> G8["CPU Proxy 线程读取 index"]
+    G8 --> G9["CPU 构造并提交 WQE"]
+    G9 --> G7
+```
+
+| 后端 | 触发条件 | WQE 构造者 | 延迟 | 适用场景 |
+|---|---|---|---|---|
+| **GDAKI** | `NCCL_GIN_GDAKI_ENABLE=1` (默认) | **GPU 线程** (通过 DOCA GPUNetIO verbs) | 低 (无 CPU 介入) | 高性能场景 (DeepEP V2 默认) |
+| **Proxy** | `NCCL_GIN_PROXY_ENABLE=1` | CPU Proxy 线程 | 较高 (需要 CPU 中转) | 调试或不支持 GDAKI 的环境 |
+
+> **关键发现**: GDAKI 后端的底层硬件操作与 V1 的 IBGDA **完全相同** — 都是由 GPU 线程直接构造 Mellanox WQE、写入 BlueFlame Doorbell 寄存器、轮询 CQE。区别仅在于 GDAKI 通过 DOCA GPUNetIO verbs 库封装了这些操作，而 IBGDA 通过 NVSHMEM 的自定义内联函数实现。
+
+```mermaid
+flowchart TB
+    subgraph "V1: NVSHMEM IBGDA"
+        I1["GPU Thread"] --> I2["ibgda_write_rdma_write_wqe()"]
+        I2 --> I3["手动构造 ctrl_seg + raddr_seg + data_seg"]
+        I3 --> I4["ibgda_ring_db()"]
+        I4 --> I5["写入 BF Doorbell"]
         I5 --> I6["NIC"]
     end
-    
-    subgraph "V2: NCCL GIN (抽象层)"
+
+    subgraph "V2: NCCL GIN (GDAKI 后端)"
         G1["GPU Thread"] --> G2["ncclGin.put()"]
-        G2 --> G3["NCCL 内部处理 WQE"]
-        G3 --> G4["NCCL 管理 QP/内存注册"]
-        G4 --> G5["NIC"]
+        G2 --> G3["doca_gpu_dev_verbs_put()"]
+        G3 --> G4["doca_gpu_dev_verbs_wqe_prepare_write()"]
+        G4 --> G5["构造 ctrl_seg + raddr_seg + data_seg"]
+        G5 --> G6["doca_gpu_dev_verbs_ring_db()"]
+        G6 --> G7["写入 BF Doorbell"]
+        G7 --> I6
     end
 ```
 
@@ -752,6 +779,206 @@ struct Compiler {
 - 无需安装时编译 CUDA 代码
 - 支持动态 hidden/topk/expert 配置
 
+### 3.6 NCCL GIN 内部实现: GDAKI 后端详解
+
+#### 3.6.1 GDAKI 调用链路
+
+当 DeepEP V2 调用 `gin.put()` 时，NCCL GIN 内部通过 `ncclGinCallImpl` 分发到 GDAKI 后端，最终调用 DOCA GPUNetIO verbs 完成 GPU 直连 RDMA。完整调用链如下:
+
+```mermaid
+flowchart TD
+    A["DeepEP: gin.put(team, rank, win, offset, ...)"] --> B["NCCL GIN: ncclGinCallImpl 分发"]
+    B --> C["GDAKI: ncclGinApi_Put&lt;GDAKI&gt;()"]
+    C --> D["DOCA GPUNetIO: doca_gpu_dev_verbs_put()"]
+    D --> E["doca_gpu_dev_verbs_reserve_wq_slots()<br/>原子预留 WQE 槽位"]
+    E --> F["doca_gpu_dev_verbs_wqe_prepare_write()<br/>构造 RDMA Write WQE"]
+    F --> G["ctrl_seg: 操作码 + WQE 索引 + QPN"]
+    F --> H["raddr_seg: 远程地址 (字节序转换)"]
+    F --> I["data_seg: 本地地址 + lkey + 长度"]
+    G --> J["doca_gpu_dev_verbs_submit_db()<br/>提交 Doorbell"]
+    H --> J
+    I --> J
+    J --> K["doca_gpu_dev_verbs_lock()"]
+    K --> L["atomicMax(prod_idx)"]
+    L --> M{"有新的 WQE?"}
+    M -->|"Yes"| N["doca_gpu_dev_verbs_ring_db()<br/>写入 BF 寄存器"]
+    N --> O["doca_gpu_dev_verbs_update_dbr()<br/>更新 Doorbell Record"]
+    O --> P["doca_gpu_dev_verbs_ring_db()<br/>再次 ring BF"]
+    P --> Q["doca_gpu_dev_verbs_unlock()"]
+    M -->|"No"| Q
+    Q --> R["NIC 硬件处理 RDMA Write"]
+```
+
+关键源文件:
+- 分发逻辑: `nccl/src/include/nccl_device/gin/gin_device_common.h` — `ncclGinCallImpl` 根据 `NCCL_GIN_GDAKI_ENABLE` 宏选择后端
+- GDAKI 入口: `nccl/src/include/nccl_device/gin/gdaki/gin_gdaki.h` — `ncclGinApi_Put<GDAKI>` 调用 `doca_gpu_dev_verbs_put()`
+- DOCA Verbs: `nccl/src/transport/net_ib/gdaki/doca-gpunetio/include/device/doca_gpunetio_dev_verbs_qp.cuh` — WQE 构造、Doorbell、CQE 轮询
+
+#### 3.6.2 GDAKI 核心数据结构
+
+```cuda
+// gin_gdaki.h — GDAKI GPU 上下文
+struct ncclGinGdakiGPUContext {
+    struct doca_gpu_dev_verbs_qp* tx_qps;   // 发送 QP 数组 (每个对端 rank 一个)
+    uint32_t*                      dbrec;    // Doorbell Record 基地址
+    uint64_t*                      bf;       // BlueFlame 寄存器基地址
+};
+
+// gin_gdaki.h — GDAKI 内存句柄
+struct ncclGinGdakiMemHandle {
+    uint32_t lkey;    // 本地内存注册密钥
+    uint32_t* rkeys;  // 远程内存注册密钥数组 (编译时常量内存)
+};
+```
+
+#### 3.6.3 DOCA GPUNetIO Verbs WQE 构造详解
+
+`doca_gpu_dev_verbs_wqe_prepare_write()` 是 GDAKI 的核心函数，与 IBGDA 的 `ibgda_write_rdma_write_wqe()` 执行完全相同的硬件操作:
+
+```cuda
+// doca_gpunetio_dev_verbs_qp.cuh: doca_gpu_dev_verbs_wqe_prepare_write()
+__device__ __forceinline__ doca_gpu_error_t doca_gpu_dev_verbs_wqe_prepare_write(
+    struct doca_gpu_dev_verbs_qp* qp,     // QP 指针
+    uint32_t pi,                           // Producer Index (WQE 索引)
+    uint32_t bytes,                        // 传输字节数
+    uint64_t remote_addr,                  // 远程地址
+    uint32_t rkey,                         // 远程内存密钥
+    uint64_t local_addr,                   // 本地地址
+    uint32_t lkey) {                       // 本地内存密钥
+
+    // 1. 定位 WQE 槽位 (环形缓冲区)
+    uint8_t* wqe = qp->sq_buf + (pi & (qp->sq_wqe_cnt - 1)) * WQE_SIZE;
+
+    // 2. 构造控制段 (ctrl_seg) — 操作码、WQE 索引、QP 号
+    //    使用 HtoBE32 进行字节序转换 (与 IBGDA 完全相同)
+    uint32_t ctrl_seg_0 = bswap32((pi << 8) | MLX5_OPCODE_RDMA_WRITE);
+    uint32_t ctrl_seg_2 = bswap32(qp->qpn << 8);
+    // 写入 WQE (relaxed store)
+    *(uint32_t*)(wqe + 0)  = ctrl_seg_0;
+    *(uint32_t*)(wqe + 8)  = ctrl_seg_2;
+
+    // 3. 构造远程地址段 (raddr_seg)
+    *(uint64_t*)(wqe + 16) = bswap64(remote_addr);   // 大端序远程地址
+    *(uint32_t*)(wqe + 24) = bswap32(rkey);           // 大端序远程密钥
+
+    // 4. 构造数据段 (data_seg)
+    *(uint32_t*)(wqe + 32) = bswap32(bytes);          // 大端序传输长度
+    *(uint32_t*)(wqe + 36) = lkey;                    // 本地密钥 (已是正确序)
+    *(uint64_t*)(wqe + 40) = bswap64(local_addr);     // 大端序本地地址
+
+    return DOCA_SUCCESS;
+}
+```
+
+#### 3.6.4 DOCA GPUNetIO Verbs Doorbell 提交详解
+
+```cuda
+// doca_gpunetio_dev_verbs_qp.cuh: doca_gpu_dev_verbs_submit_db()
+// 完整的 Doorbell 提交流程 (与 IBGDA ibgda_post_send() 逻辑完全一致)
+__device__ __forceinline__ doca_gpu_error_t doca_gpu_dev_verbs_submit_db(
+    struct doca_gpu_dev_verbs_qp* qp, uint32_t new_prod_idx) {
+
+    // 1. 获取锁 (防止多线程并发提交)
+    doca_gpu_dev_verbs_lock(&qp->sq_lock);
+
+    // 2. 原子更新 producer index (取最大值)
+    uint32_t old_prod_idx = atomicMax(&qp->prod_idx, new_prod_idx);
+
+    // 3. 如果有新的 WQE，提交到硬件
+    if (new_prod_idx > old_prod_idx) {
+        // 3a. 更新 Doorbell Record
+        doca_gpu_dev_verbs_update_dbr(qp, new_prod_idx);
+        // 3b. 写入 BlueFlame 寄存器 (触发 NIC 读取 WQE)
+        doca_gpu_dev_verbs_ring_db(qp, new_prod_idx);
+        // 3c. 再次更新 DBR (确保 NIC 看到最新值)
+        doca_gpu_dev_verbs_update_dbr(qp, new_prod_idx);
+        // 3d. 再次写入 BF (Mellanox 要求的双次 ring)
+        doca_gpu_dev_verbs_ring_db(qp, new_prod_idx);
+    }
+
+    // 4. 释放锁
+    doca_gpu_dev_verbs_unlock(&qp->sq_lock);
+    return DOCA_SUCCESS;
+}
+```
+
+#### 3.6.5 字节序转换对比
+
+两个方案的字节序转换实现本质完全相同，都使用 PTX `prmt.b32` 指令:
+
+```cuda
+// IBGDA (ibgda_device.cuh): HtoBE32
+__device__ uint32_t HtoBE32(uint32_t x) {
+    asm("prmt.b32 %0, %1, 0, 0x0123;" : "=r"(ret) : "r"(x));
+}
+
+// GDAKI (doca_gpunetio_dev_verbs_qp.cuh): doca_gpu_dev_verbs_bswap32
+__device__ uint32_t doca_gpu_dev_verbs_bswap32(uint32_t x) {
+    asm("prmt.b32 %0, %1, 0, 0x0123;" : "=r"(ret) : "r"(x));
+}
+// 完全相同的 PTX 指令，不同的函数名
+```
+
+### 3.7 IBGDA vs GDAKI 逐函数对比
+
+以下表格精确映射了 V1 IBGDA 和 V2 NCCL GDAKI 在硬件操作层面的对应关系:
+
+| 操作 | V1: NVSHMEM IBGDA | V2: NCCL GDAKI | 是否相同 |
+|---|---|---|---|
+| **RDMA Write WQE 构造** | `ibgda_write_rdma_write_wqe()` | `doca_gpu_dev_verbs_wqe_prepare_write()` | **相同** — 都构造 ctrl_seg + raddr_seg + data_seg |
+| **Inline Write WQE 构造** | `ibgda_write_rdma_write_inl_wqe()` | `doca_gpu_dev_verbs_wqe_prepare_write_inl()` | **相同** — 小数据内联传输 |
+| **Atomic WQE 构造** | `ibgda_write_amo_wqe()` | `doca_gpu_dev_verbs_wqe_prepare_atomic()` | **相同** — 远程原子操作 |
+| **Doorbell Ring** | `ibgda_ring_db()` | `doca_gpu_dev_verbs_ring_db()` | **相同** — 写入 BlueFlame 寄存器 |
+| **Doorbell Record 更新** | `ibgda_update_dbr()` | `doca_gpu_dev_verbs_update_dbr()` | **相同** — HtoBE32 + 写入共享内存 |
+| **完整提交流程** | `ibgda_post_send()` | `doca_gpu_dev_verbs_submit_db()` | **相同** — lock + atomicMax + ring_db + update_dbr |
+| **WQE 槽位预留** | `ibgda_reserve_wqe_slots()` | `doca_gpu_dev_verbs_reserve_wq_slots()` | **相同** — atomicAdd 预留 |
+| **内存密钥获取** | `ibgda_get_lkey_and_rkey()` | `loadConst(&dstMh->rkeys + peer)` / `loadConst(&srcMh->lkey)` | **相似** — GDAKI 使用编译时常量，IBGDA 有常量/全局内存两级 |
+| **完成确认** | `ibgda_poll_cq()` | `doca_gpu_dev_verbs_wait()` | **相同** — 轮询 CQE 的 wqe_counter |
+| **锁机制** | `ibgda_lock_acquire/release` | `doca_gpu_dev_verbs_lock/unlock` | **相同** — atomicCAS 自旋锁 |
+| **32 位字节序转换** | `HtoBE32()` | `doca_gpu_dev_verbs_bswap32()` | **完全相同** — 同一条 PTX `prmt.b32` 指令 |
+| **64 位字节序转换** | `HtoBE64()` | `doca_gpu_dev_verbs_bswap64()` | **完全相同** — 同一条双 `prmt.b32` PTX 指令 |
+| **Warp 级提交** | `ibgda_submit_bf_warp()` (warp 协作) | `doca_gpu_dev_verbs_submit_bf_warp()` (warp 协作) | **相同** — warp 内 lane 分工提交 |
+| **TMA BlueFlame** | N/A (V1 未使用) | `doca_gpu_dev_verbs_ring_bf()` | **V2 新增** — Hopper TMA 异步写 BF |
+| **DBR 字节序准备** | 内联在 `ibgda_update_dbr()` | `doca_gpu_dev_verbs_prepare_dbr()` | **相同** — HtoBE32 转换 |
+| **Wait WQE 构造** | N/A | `doca_gpu_dev_verbs_wqe_prepare_wait()` | **V2 新增** — NIC 端等待原语 |
+
+#### 关键结论
+
+```mermaid
+flowchart LR
+    subgraph "共同的硬件层"
+        H1["Mellanox ConnectX NIC"]
+        H2["BlueFlame Doorbell"]
+        H3["WQE: ctrl + raddr + data seg"]
+        H4["CQE: 完成队列轮询"]
+        H5["QP: 可靠连接"]
+        H6["LKey/RKey: 内存注册"]
+    end
+
+    subgraph "V1: IBGDA 封装层"
+        V1A["NVSHMEM ibgda_device.cuh"]
+        V1B["自定义 __device__ 内联函数"]
+        V1C["手动管理 constmem/globalmem 密钥表"]
+    end
+
+    subgraph "V2: GDAKI 封装层"
+        V2A["DOCA GPUNetIO verbs"]
+        V2B["doca_gpu_dev_verbs_* API"]
+        V2C["NCCL 自动管理 rkeys (编译时常量)"]
+    end
+
+    V1A --> H3
+    V1B --> H2
+    V1C --> H6
+    V2A --> H3
+    V2B --> H2
+    V2C --> H6
+```
+
+> **总结**: IBGDA 和 GDAKI 在硬件操作层面是**同一套机制的两套封装**。它们的核心操作完全相同: GPU 线程在设备内存中构造 Mellanox WQE、通过 BlueFlame 寄存器提交到 NIC、轮询 CQE 确认完成。区别在于:
+> - **IBGDA** 由 NVSHMEM 团队实现，直接暴露底层细节，DeepEP V1 在此基础上进一步定制了 warp 级协作发送
+> - **GDAKI** 由 NVIDIA DOCA 团队实现，提供更规范的 API 封装 (`doca_gpu_dev_verbs_*`)，并新增了 TMA BlueFlame 和 Wait WQE 等 Hopper 特性
+
 ---
 
 ## 4. V1 vs V2 对比分析
@@ -767,33 +994,42 @@ flowchart LR
         V1D["硬件: 直接操作 Mellanox WQE/BF"]
         V1A --> V1B --> V1C --> V1D
     end
-    
-    subgraph "V2: NCCL GIN"
+
+    subgraph "V2: NCCL GIN (GDAKI)"
         V2A["Python: ElasticBuffer"]
         V2B["C++: NCCLSymmetricMemoryContext"]
         V2C["CUDA: NCCLGin handle"]
-        V2D["NCCL: gin.put/signal/get"]
-        V2E["硬件: NCCL 内部管理"]
-        V2A --> V2B --> V2C --> V2D --> V2E
+        V2D["GIN: gin.put/signal/get"]
+        V2E["GDAKI: doca_gpu_dev_verbs_*"]
+        V2F["硬件: 同样操作 Mellanox WQE/BF"]
+        V2A --> V2B --> V2C --> V2D --> V2E --> V2F
     end
 ```
 
+> 两者最终都通过 GPU 线程直接构造 Mellanox WQE 并写入 BlueFlame Doorbell，硬件路径完全一致。
+
 ### 4.2 核心差异对比表
 
-| 维度 | V1 (IBGDA) | V2 (NCCL GIN) |
-|---|---|---|
-| **硬件抽象** | 直接构造 Mellanox WQE | NCCL GIN 抽象层 |
-| **QP 管理** | 手动通过 NVSHMEM 环境变量配置 | `ncclDevCommCreate` 请求资源 |
-| **内存注册** | NVSHMEM 对称内存 + lkey/rkey 手动管理 | `ncclMemAlloc` + `ncclCommWindowRegister` |
-| **NVLink 访问** | CUDA Virtual Memory + IPC handle | NCCL LSA 指针 (`ncclGetLsaPointer`) |
-| **RDMA Put** | `nvshmemi_ibgda_put_nbi_warp` (warp 协作构造 WQE) | `gin.put()` (单线程调用) |
-| **RDMA 原子** | `nvshmemi_ibgda_amo_nonfetch_add` (构造 AMO WQE) | `gin.signal(ncclGin_VASignalAdd(...))` |
-| **完成等待** | `ibgda_poll_cq` (轮询 CQE) | `gin.flushAsync()` + `gin.wait()` |
-| **屏障** | 自定义 NVLink barrier + nvshmem_sync | GIN signal barrier + NVLink atomic barrier |
-| **依赖库** | NVSHMEM v3.3.9+ | NCCL 2.30.4+ |
-| **编译** | 安装时预编译 | 运行时 JIT |
-| **SM 数量** | 最多 24 SM | 4-6 SM |
-| **性能** | 超过硬件带宽的 80-90% | 高达 1.3x V1 峰值 |
+| 维度 | V1 (IBGDA) | V2 (NCCL GIN / GDAKI) | 说明 |
+|---|---|---|---|
+| **WQE 构造** | `ibgda_write_rdma_write_wqe()` | `doca_gpu_dev_verbs_wqe_prepare_write()` | **硬件操作相同**: 构造 ctrl_seg + raddr_seg + data_seg |
+| **Doorbell 机制** | `ibgda_ring_db()` + `ibgda_update_dbr()` | `doca_gpu_dev_verbs_ring_db()` + `doca_gpu_dev_verbs_update_dbr()` | **完全相同**: 写 BF 寄存器 + 更新 DBR |
+| **字节序转换** | `HtoBE32()` / `HtoBE64()` (PTX prmt) | `bswap32()` / `bswap64()` (PTX prmt) | **完全相同**: 同一条 PTX 指令 |
+| **提交流程** | `ibgda_post_send()`: lock→atomicMax→ring_db→update_dbr | `doca_gpu_dev_verbs_submit_db()`: lock→atomicMax→ring_db→update_dbr | **逻辑完全相同** |
+| **WQE 预留** | `ibgda_reserve_wqe_slots()` (atomicAdd) | `doca_gpu_dev_verbs_reserve_wq_slots()` (atomicAdd) | **完全相同** |
+| **完成确认** | `ibgda_poll_cq()` (轮询 CQE wqe_counter) | `doca_gpu_dev_verbs_wait()` (轮询 CQE wqe_counter) | **完全相同** |
+| **API 封装层级** | 底层: DeepEP 直接调用 IBGDA 内联函数 | 高层: `gin.put()` → GDAKI → DOCA verbs | V2 多了一层抽象 |
+| **QP 管理** | 手动通过 NVSHMEM 环境变量配置 (`NVSHMEM_IBGDA_NUM_RC_PER_PE` 等) | `ncclDevCommCreate` 请求资源，`get_qp_mode()` 分配 | V2 更自动化 |
+| **内存注册** | NVSHMEM 对称内存 + lkey/rkey 手动查表 (constmem/globalmem) | `ncclMemAlloc` + `ncclCommWindowRegister`，NCCL 自动管理密钥 | V2 密钥管理更简洁 |
+| **NVLink 访问** | CUDA Virtual Memory API (`cuMemCreate` + IPC handle) | NCCL LSA 指针 (`ncclGetLsaPointer`) | 机制不同，效果相同 |
+| **RDMA Put 入口** | `nvshmemi_ibgda_put_nbi_warp()` (warp 协作) | `gin.put()` (封装后单线程调用) | V1 warp 内多 lane 并行写 WQE |
+| **RDMA 原子** | `nvshmemi_ibgda_amo_nonfetch_add` (构造 AMO WQE) | `gin.signal(ncclGin_VASignalAdd(...))` | 底层都构造 Atomic WQE |
+| **屏障策略** | 串行: NVLink barrier → RDMA barrier | 并行: scaleup + scaleout barrier 同时执行 | V2 屏障并行化是关键优化 |
+| **TMA 集成** | 不使用 | `doca_gpu_dev_verbs_ring_bf()` TMA 异步写 BF | V2 利用 Hopper TMA 新特性 |
+| **依赖库** | NVSHMEM v3.3.9+ | NCCL 2.30.4+ (含 DOCA GPUNetIO) | 不同的库，相同硬件路径 |
+| **编译方式** | 安装时预编译 (setup.py) | 运行时 JIT 编译 (NVRTC) | V2 更灵活 |
+| **SM 占用** | 最多 24 SM | 4-6 SM | V2 更高效 |
+| **性能** | 超过硬件带宽的 80-90% | 高达 1.3x V1 峰值 | V2 SM 效率更高 |
 
 ### 4.3 数据路径对比
 
@@ -811,18 +1047,21 @@ flowchart TD
     H --> I["NIC 硬件处理 RDMA Write"]
 ```
 
-#### V2 数据发送路径 (NCCL GIN)
+#### V2 数据发送路径 (NCCL GIN / GDAKI)
 
 ```mermaid
 flowchart TD
-    A["GPU Thread 读取 token 数据"] --> B["gin.put()<br/>调用 NCCL GIN API"]
-    B --> C["NCCL 内部处理"]
-    C --> D["NCCL 自动选择路径:<br/>NVLink 或 RDMA"]
-    D --> E["NCCL 管理 WQE 构造<br/>和内存注册"]
-    E --> F["NIC 硬件处理"]
-    
-    A --> G["可选: get_sym_ptr()<br/>NVLink 直接写"]
-    G --> H["直接通过 LSA 指针写入"]
+    A["GPU Thread 读取 token 数据"] --> B{"目标 rank 是否 NVLink 可达?"}
+    B -->|"Yes"| C["get_sym_ptr()<br/>获取 LSA 对称指针"]
+    C --> D["直接通过 NVLink 写入<br/>(ptx::st_na_relaxed)"]
+    B -->|"No (RDMA)"| E["gin.put(team, rank, win, offset, ...)"]
+    E --> F["ncclGinCallImpl 分发到 GDAKI"]
+    F --> G["doca_gpu_dev_verbs_put()"]
+    G --> H["doca_gpu_dev_verbs_reserve_wq_slots()<br/>atomicAdd 预留 WQE"]
+    H --> I["doca_gpu_dev_verbs_wqe_prepare_write()<br/>构造 ctrl + raddr + data seg"]
+    I --> J["doca_gpu_dev_verbs_submit_db()<br/>lock → atomicMax → ring_db → update_dbr"]
+    J --> K["写入 BlueFlame Doorbell"]
+    K --> L["NIC 硬件处理 RDMA Write"]
 ```
 
 ### 4.4 内存管理对比
@@ -905,22 +1144,26 @@ recv_x, _, _, handle, event = buf.dispatch(x, handle=cached_handle, ...)
 
 | 术语 | 全称 | 说明 |
 |---|---|---|
-| **IBGDA** | InfiniBand GPUDirect RDMA Async | NVSHMEM 的 GPU 发起 RDMA 机制 |
-| **GIN** | Global InfiniBand Network | NCCL 的设备端通信抽象层 |
+| **IBGDA** | InfiniBand GPUDirect RDMA Async | NVSHMEM 的 GPU 发起 RDMA 机制，由 GPU 线程直接构造 WQE |
+| **GIN** | Global InfiniBand Network | NCCL 的设备端通信抽象层，提供 `put`/`get`/`signal` 等 API |
+| **GDAKI** | GPU-Direct Accelerated Kernel Interface | NCCL GIN 的 GPU 直连后端，通过 DOCA GPUNetIO verbs 实现，硬件操作与 IBGDA 相同 |
+| **DOCA GPUNetIO** | DOCA GPU Network I/O | NVIDIA DOCA 框架的 GPU 网络通信库，提供 `doca_gpu_dev_verbs_*` 设备端 API |
 | **QP** | Queue Pair | InfiniBand 可靠连接的发送/接收队列对 |
-| **WQE** | Work Queue Entry | 描述一次 RDMA 操作的条目 |
-| **BF** | BlueFlame | Mellanox 网卡的 doorbell 直接写入机制 |
-| **DBR** | Doorbell Record | 通知 NIC 有新 WQE 的共享记录 |
-| **CQE** | Completion Queue Entry | 操作完成通知条目 |
-| **LSA** | Local Shared Address | NCCL NVLink 域内的对称地址空间 |
+| **WQE** | Work Queue Entry | 描述一次 RDMA 操作的条目，包含 ctrl_seg + raddr_seg + data_seg |
+| **BF** | BlueFlame | Mellanox 网卡的 doorbell 直接写入机制，GPU 可直接写入触发发送 |
+| **DBR** | Doorbell Record | 通知 NIC 有新 WQE 的共享记录，需大端序写入 |
+| **CQE** | Completion Queue Entry | 操作完成通知条目，GPU 通过轮询 wqe_counter 确认完成 |
+| **LSA** | Local Shared Address | NCCL NVLink 域内的对称地址空间，支持跨 GPU 直接指针访问 |
+| **ncclTeam** | NCCL Team | NCCL 通信组: TeamWorld (全局)、TeamLsa (NVLink)、TeamRail (同位置跨节点) |
+| **ncclWindow** | NCCL Window | NCCL 对称内存窗口，类似 NVSHMEM symmetric heap |
 | **LKey** | Local Key | 本地内存注册密钥 |
 | **RKey** | Remote Key | 远程内存注册密钥 |
 | **NVLink** | NVIDIA NVLink | NVIDIA 高速 GPU 互联 |
-| **RDMA** | Remote Direct Memory Access | 远程直接内存访问 |
+| **RDMA** | Remote Direct Memory Access | 远程直接内存访问，无需 CPU 介入 |
 | **MoE** | Mixture of Experts | 混合专家模型 |
 | **EP** | Expert Parallelism | 专家并行 |
-| **JIT** | Just-In-Time Compilation | 运行时即时编译 |
-| **TMA** | Tensor Memory Accelerator | Hopper 架构的异步内存拷贝引擎 |
+| **JIT** | Just-In-Time Compilation | 运行时即时编译 (V2 使用 NVRTC) |
+| **TMA** | Tensor Memory Accelerator | Hopper 架构的异步内存拷贝引擎，V2 GDAKI 用于异步写 BF |
 | **SM** | Streaming Multiprocessor | GPU 流式多处理器 |
 | **CTA** | Cooperative Thread Array | GPU 线程块 (即 CUDA block) |
 | **NVL** | NVLink | 同义词，指 NVLink 域内通信 |
